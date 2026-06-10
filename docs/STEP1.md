@@ -7,7 +7,10 @@ allocation patterns before designing the pool allocator (Step 2). Release builds
 do not reference the profiler at all — zero overhead.
 
 All allocations on both the control plane (CP) and data plane (DP) go through
-these wrappers, so the profiler sees everything.
+these wrappers, so the profiler sees everything. The implementation is **C**
+(DP is C-only); the whole of `src/profiler/shm_profiler.c` is wrapped in
+`#ifdef MEM_MANAGER_PROFILE`, so release builds contain no profiler code and no
+pthread dependency.
 
 ## Mapping to the OS API
 
