@@ -107,7 +107,7 @@ tools/analyze_profile.py             offline analyser (Python 3 stdlib)
     emits `live_at_exit` + `summary` at `atexit`. Records carry
     `ts_ns, pid, shmname, addr, size, flags, ret` (+ `pgname`), and on unmap
     `matched` / `lifetime_ns`.
-  - **DP (selected by `MEM_MANAGER_DP`):** stateless; formats each event as one JSON
+  - **DP (selected when `IS_CP` is absent):** stateless; formats each event as one JSON
     line and emits it through the OS `LOG_FILE_INFO(module, …)` macro. Time and
     identity come from the log's own line prefix (wall-clock on CP, `[pg][vcpu]
     [TSC]` on DP); a single atomic reentrancy flag prevents recursion if a log
@@ -155,11 +155,11 @@ Informed by Step-1 data:
 
 - Hand-port `src/platform_shm.c` and `src/profiler/*`; `src/os/*` is only the
   standalone stub.
-- Build with `-DMEM_MANAGER_USE_API_H=ON` so `INT32`/`UINT32` and the OS `Shm*`
-  come from the internal `api.h`.
+- Build with `-DMEM_MANAGER_USE_API_H=ON` so `INT32`/`UINT32`, the OS `Shm*` and
+  the business `IS_CP` macro come from the internal `api.h`.
 - Enable `MEM_MANAGER_PROFILE` in the platform's Debug build to capture profiles.
-- **DP builds add one flag: `MEM_MANAGER_DP`.** It marks the data plane and
-  derives both DP-specific behaviours: drop `Platform_ShmMapOnPg` (a CP-only OS
-  symbol — otherwise the DP `.a` fails at link with "undefined reference to
-  ShmMapOnPg") and select the log-based profiler backend (DP has no libc). CP
-  builds define nothing extra. See docs/STEP1.md for the full flag table.
+- **No mem-manager CP/DP flag.** mem-manager keys off the business's own `IS_CP`
+  macro: when absent (data plane) it drops `Platform_ShmMapOnPg` (a CP-only OS
+  symbol — otherwise the DP `.a` fails at link) and selects the log profiler
+  backend (DP has no libc). CP and DP builds use the same mem-manager flags. See
+  docs/STEP1.md.

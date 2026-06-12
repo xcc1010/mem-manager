@@ -3,20 +3,20 @@
 /* The entire profiler exists only in Debug builds. In release this file is an
  * empty translation unit: no code, no dependency at all.
  *
- * Two compile-time backends:
- *   (default)            CP: writes JSONL to a per-process file (libc).
- *   MEM_PROFILE_VIA_LOG  DP: formats each event as one JSON line and hands it to
- *                            the OS LOG_FILE_INFO macro. Time and identity come
- *                            from the log's own line prefix; analyze_profile.py
- *                            unwraps them offline. */
+ * Two compile-time backends, picked by the business IS_CP macro:
+ *   IS_CP defined -> control plane: writes JSONL to a per-process file (libc).
+ *   IS_CP absent  -> data plane: formats each event as one JSON line and hands
+ *                    it to the OS LOG_FILE_INFO macro. Time and identity come
+ *                    from the log's own line prefix; analyze_profile.py unwraps
+ *                    them offline. */
 #ifdef MEM_MANAGER_PROFILE
 
 #include <stdatomic.h>
 #include <stdint.h>
 
-/* Spinlock for the CP file backend (needs no pthread). The VIA_LOG backend is
- * stateless and uses a reentrancy flag instead, so it is excluded here. */
-#ifndef MEM_PROFILE_VIA_LOG
+/* Spinlock for the CP file backend (needs no pthread). The data-plane log
+ * backend is stateless and uses a reentrancy flag instead, so it is excluded. */
+#ifdef IS_CP
 static atomic_flag g_lock = ATOMIC_FLAG_INIT;
 
 static void mm_lock(void) {
@@ -30,8 +30,8 @@ static void mm_unlock(void) {
 }
 #endif
 
-/* ===== libc-free JSON formatting for the VIA_LOG backend ================== */
-#ifdef MEM_PROFILE_VIA_LOG
+/* ===== libc-free JSON formatting for the data-plane log backend =========== */
+#ifndef IS_CP
 typedef struct {
     char*    b;
     unsigned cap;
@@ -121,10 +121,10 @@ static void b_json(Buf* b, const char* s) {
         }
     }
 }
-#endif /* VIA_LOG */
+#endif /* data plane */
 
 /* ======================================================================== */
-#if defined(MEM_PROFILE_VIA_LOG)
+#ifndef IS_CP
 /* ===== Data-plane backend: emit each event through the OS log macro ======
  *
  * Stateless: each call formats a JSON payload on the stack and hands it to

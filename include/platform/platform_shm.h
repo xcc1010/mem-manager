@@ -17,11 +17,11 @@ INT32 Platform_ShmMap(INT32 flags, char* shmname, UINT32 size, void** shm);
 // Map on the numa node where pgname resides. Mirrors ShmMapOnPg
 // (note: pgname is the second parameter).
 //
-// ShmMapOnPg is a control-plane-only OS symbol; the data-plane (DP) link
-// environment does not provide it. DP builds must define
-// MEM_MANAGER_NO_SHMMAPONPG so this wrapper is not compiled or referenced,
-// otherwise linking the DP .a fails with "undefined reference to ShmMapOnPg".
-#ifndef MEM_MANAGER_NO_SHMMAPONPG
+// ShmMapOnPg is a control-plane-only OS symbol; the data-plane link environment
+// does not provide it. The wrapper is compiled only on the control plane (where
+// the business defines IS_CP); on the data plane it is omitted, so linking the
+// DP .a does not fail with "undefined reference to ShmMapOnPg".
+#ifdef IS_CP
 INT32 Platform_ShmMapOnPg(INT32 flags, char* pgname, char* shmname, UINT32 size, void** shm);
 #endif
 

@@ -15,10 +15,9 @@ INT32 Platform_ShmMap(INT32 flags, char* shmname, UINT32 size, void** shm) {
     return ret;
 }
 
-// ShmMapOnPg exists only in the control-plane link environment; DP builds
-// define MEM_MANAGER_NO_SHMMAPONPG to drop this wrapper (and its reference to
-// the OS symbol) entirely. See platform_shm.h.
-#ifndef MEM_MANAGER_NO_SHMMAPONPG
+// ShmMapOnPg exists only in the control-plane link environment, so this wrapper
+// is compiled only when IS_CP is defined (see platform_shm.h).
+#ifdef IS_CP
 INT32 Platform_ShmMapOnPg(INT32 flags, char* pgname, char* shmname, UINT32 size, void** shm) {
     INT32 ret = ShmMapOnPg(flags, pgname, shmname, size, shm);
 #ifdef MEM_MANAGER_PROFILE
