@@ -1,20 +1,279 @@
 #include "profiler/shm_profiler.h"
 
 /* The entire profiler exists only in Debug builds. In release this file is an
- * empty translation unit: no code, no dependency at all.
- *
- * DP-friendly I/O: output goes through raw open()/write()/close() (no stdio
- * FILE handles or fflush) and the lock is a C11 atomic_flag spinlock (no
- * pthread). The
- * only runtime symbols required are open/write/close, atexit, malloc/free,
- * getenv and snprintf/vsnprintf (string formatting only, no FILE*). This lets
- * the profiler link in the data-plane (DP) toolchain, which provides neither
- * buffered stdio nor pthread. */
+ * empty translation unit: no code, no dependency at all. */
 #ifdef MEM_MANAGER_PROFILE
 
-#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
+
+/* Spinlock shared by both backends: lets the profiler need no pthread. */
+static atomic_flag g_lock = ATOMIC_FLAG_INIT;
+
+static void mm_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_lock, memory_order_acquire)) {
+        /* spin: contention is rare and each critical section is tiny */
+    }
+}
+
+static void mm_unlock(void) {
+    atomic_flag_clear_explicit(&g_lock, memory_order_release);
+}
+
+/* ======================================================================== */
+#ifdef MEM_PROFILE_SELF_CONTAINED
+/* ===== Data-plane backend: zero libc, zero log, fixed static buffer ======
+ *
+ * The DP link environment provides neither libc (malloc/stdio/snprintf under
+ * the names we'd call) nor a usable log (the platform log itself calls ShmMap
+ * and would recurse). So the hot path here touches NOTHING external: it only
+ * takes the spinlock and copies the event into a static array in BSS. Numbers
+ * and JSON are produced by hand (no snprintf); time/pid come from injected
+ * hooks. Output happens only in shm_profiler_dump(), off the hot path. */
+
+#ifndef MEM_PROFILE_DP_CAPACITY
+#  define MEM_PROFILE_DP_CAPACITY (1u << 16)   /* 65536 events; tune as needed */
+#endif
+#ifndef MEM_PROFILE_DP_NAMEMAX
+#  define MEM_PROFILE_DP_NAMEMAX 48            /* shmname is truncated to this */
+#endif
+
+enum { EV_MAP = 0, EV_MAP_ON_PG = 1, EV_UNMAP = 2 };
+
+typedef struct {
+    long long     ts;
+    const void*   addr;
+    UINT32        size;
+    INT32         flags;
+    INT32         ret;
+    unsigned char ev;
+    char          name[MEM_PROFILE_DP_NAMEMAX];
+} Rec;
+
+/* The whole event log lives in BSS — zero-initialised, no file footprint. */
+static Rec    g_recs[MEM_PROFILE_DP_CAPACITY];
+static size_t g_count;
+static size_t g_dropped;
+
+static struct {
+    long long (*now_ns)(void);
+    int       (*get_pid)(void);
+} g_env = { 0, 0 };
+
+void shm_profiler_set_env(const shm_profiler_env* env) {
+    mm_lock();
+    g_env.now_ns  = env ? env->now_ns  : 0;
+    g_env.get_pid = env ? env->get_pid : 0;
+    mm_unlock();
+}
+
+unsigned long shm_profiler_dropped(void) {
+    return (unsigned long)g_dropped;
+}
+
+static long long env_now(void) {
+    return g_env.now_ns ? g_env.now_ns() : 0;
+}
+
+/* Manual, libc-free string copy with truncation (no strlen/strncpy/memcpy). */
+static void copy_name(char* dst, const char* src) {
+    int i = 0;
+    if (src) {
+        for (; src[i] && i < MEM_PROFILE_DP_NAMEMAX - 1; ++i) {
+            dst[i] = src[i];
+        }
+    }
+    dst[i] = '\0';
+}
+
+void shm_profiler_on_map(const char* op, const char* shmname, const void* addr,
+                         UINT32 size, INT32 flags, INT32 ret, const char* pgname) {
+    (void)op;
+    mm_lock();
+    if (g_count < MEM_PROFILE_DP_CAPACITY) {
+        Rec* r = &g_recs[g_count++];
+        r->ts    = env_now();
+        r->addr  = addr;
+        r->size  = size;
+        r->flags = flags;
+        r->ret   = ret;
+        r->ev    = pgname ? (unsigned char)EV_MAP_ON_PG : (unsigned char)EV_MAP;
+        copy_name(r->name, shmname);
+    } else {
+        ++g_dropped;
+    }
+    mm_unlock();
+}
+
+void shm_profiler_on_unmap(const void* addr, INT32 ret) {
+    mm_lock();
+    if (g_count < MEM_PROFILE_DP_CAPACITY) {
+        Rec* r = &g_recs[g_count++];
+        r->ts      = env_now();
+        r->addr    = addr;
+        r->size    = 0;
+        r->flags   = 0;
+        r->ret     = ret;
+        r->ev      = (unsigned char)EV_UNMAP;
+        r->name[0] = '\0';
+    } else {
+        ++g_dropped;
+    }
+    mm_unlock();
+}
+
+/* ---- libc-free JSONL formatting into a bounded stack buffer ------------- */
+typedef struct {
+    char*    b;
+    unsigned cap;
+    unsigned len;
+} Buf;
+
+static void b_raw(Buf* b, const char* s, unsigned n) {
+    unsigned room = (b->len < b->cap) ? b->cap - b->len : 0;
+    if (n > room) {
+        n = room;
+    }
+    for (unsigned i = 0; i < n; ++i) {
+        b->b[b->len + i] = s[i];
+    }
+    b->len += n;
+}
+
+static void b_str(Buf* b, const char* s) {
+    if (!s) {
+        return;
+    }
+    unsigned n = 0;
+    while (s[n]) {
+        ++n;
+    }
+    b_raw(b, s, n);
+}
+
+static void b_ch(Buf* b, char c) {
+    b_raw(b, &c, 1);
+}
+
+static void b_u64(Buf* b, unsigned long long v) {
+    char t[20];
+    int n = 0;
+    if (v == 0) {
+        t[n++] = '0';
+    }
+    while (v) {
+        t[n++] = (char)('0' + (int)(v % 10));
+        v /= 10;
+    }
+    while (n) {
+        b_ch(b, t[--n]);
+    }
+}
+
+static void b_i64(Buf* b, long long v) {
+    if (v < 0) {
+        b_ch(b, '-');
+        b_u64(b, (unsigned long long)(-(v + 1)) + 1ull);
+    } else {
+        b_u64(b, (unsigned long long)v);
+    }
+}
+
+static void b_hex(Buf* b, const void* p) {
+    uintptr_t v = (uintptr_t)p;
+    char t[2 * sizeof(void*)];
+    int n = 0;
+    b_str(b, "0x");
+    if (v == 0) {
+        t[n++] = '0';
+    }
+    while (v) {
+        int d = (int)(v & 0xf);
+        t[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+        v >>= 4;
+    }
+    while (n) {
+        b_ch(b, t[--n]);
+    }
+}
+
+static void b_json(Buf* b, const char* s) {
+    if (!s) {
+        return;
+    }
+    for (const char* p = s; *p; ++p) {
+        switch (*p) {
+        case '"':  b_str(b, "\\\""); break;
+        case '\\': b_str(b, "\\\\"); break;
+        case '\n': b_str(b, "\\n");  break;
+        case '\r': b_str(b, "\\r");  break;
+        case '\t': b_str(b, "\\t");  break;
+        default:   b_ch(b, *p);      break;
+        }
+    }
+}
+
+void shm_profiler_dump(void (*emit)(const char* buf, unsigned len)) {
+    if (!emit) {
+        return;
+    }
+    mm_lock();
+    int pid = g_env.get_pid ? g_env.get_pid() : 0;
+    char line[2 * MEM_PROFILE_DP_NAMEMAX + 256];
+    for (size_t i = 0; i < g_count; ++i) {
+        Rec* r = &g_recs[i];
+        Buf b = { line, (unsigned)sizeof line, 0 };
+        b_str(&b, "{\"ts_ns\":");
+        b_i64(&b, r->ts);
+        if (r->ev == EV_UNMAP) {
+            b_str(&b, ",\"event\":\"unmap\",\"addr\":\"");
+            b_hex(&b, r->addr);
+            b_str(&b, "\",\"ret\":");
+            b_i64(&b, r->ret);
+        } else {
+            b_str(&b, ",\"event\":\"");
+            b_str(&b, r->ev == EV_MAP_ON_PG ? "map_on_pg" : "map");
+            b_str(&b, "\",\"shmname\":\"");
+            b_json(&b, r->name);
+            b_str(&b, "\",\"addr\":\"");
+            b_hex(&b, r->addr);
+            b_str(&b, "\",\"size\":");
+            b_u64(&b, r->size);
+            b_str(&b, ",\"flags\":");
+            b_i64(&b, r->flags);
+            b_str(&b, ",\"ret\":");
+            b_i64(&b, r->ret);
+        }
+        b_str(&b, ",\"pid\":");
+        b_i64(&b, pid);
+        b_str(&b, "}\n");
+        emit(b.b, b.len);
+    }
+    {
+        Buf b = { line, (unsigned)sizeof line, 0 };
+        b_str(&b, "{\"event\":\"summary\",\"pid\":");
+        b_i64(&b, pid);
+        b_str(&b, ",\"total_events\":");
+        b_u64(&b, (unsigned long long)g_count);
+        b_str(&b, ",\"dropped\":");
+        b_u64(&b, (unsigned long long)g_dropped);
+        b_str(&b, ",\"capacity\":");
+        b_u64(&b, (unsigned long long)MEM_PROFILE_DP_CAPACITY);
+        b_str(&b, "}\n");
+        emit(b.b, b.len);
+    }
+    mm_unlock();
+}
+
+/* ======================================================================== */
+#else /* !MEM_PROFILE_SELF_CONTAINED */
+/* ===== Control-plane backend: writes JSONL straight to a file ============
+ *
+ * The CP has a normal libc. Output goes through raw open()/write()/close()
+ * (no FILE handles or fflush, kept dependency-light) and the live set
+ * resolves lifetimes inline. */
+
+#include <stdarg.h>
 #include <stdio.h>   /* snprintf / vsnprintf only — no FILE* is used */
 #include <stdlib.h>
 #include <string.h>
@@ -38,7 +297,6 @@
 #  define mm_close     close
 #endif
 
-/* ----------------------------------------------------- small utilities --- */
 static int64_t now_ns(void) {
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
@@ -72,10 +330,6 @@ static void mm_write_all(int fd, const char* buf, size_t len) {
 }
 
 /* ------------------------------------------- bounded line buffer (no stdio) */
-/* Builds one JSON line in a fixed stack buffer, then a single write() emits it.
- * A single write keeps concurrent lines from interleaving and avoids per-token
- * syscalls. Over-long lines are truncated rather than overflowing the buffer
- * (shmnames are short identifiers, so this is not a concern in practice). */
 typedef struct {
     char*  b;
     size_t cap;
@@ -101,7 +355,6 @@ static void lb_ch(LineBuf* lb, char c) {
     lb_raw(lb, &c, 1);
 }
 
-/* printf-style append for the numeric/format chunks (formatting only). */
 #if defined(__GNUC__)
 #  define MM_PRINTF_FMT(fmt_idx, first_arg) \
        __attribute__((format(gnu_printf, fmt_idx, first_arg)))
@@ -249,19 +502,6 @@ static void table_erase(Table* t, Entry* e) {
 }
 
 /* ------------------------------------------------------- global state ---- */
-/* Spinlock instead of pthread_mutex so the profiler needs no pthread. */
-static atomic_flag g_lock = ATOMIC_FLAG_INIT;
-
-static void mm_lock(void) {
-    while (atomic_flag_test_and_set_explicit(&g_lock, memory_order_acquire)) {
-        /* spin: contention is rare and each critical section is tiny */
-    }
-}
-
-static void mm_unlock(void) {
-    atomic_flag_clear_explicit(&g_lock, memory_order_release);
-}
-
 static struct {
     int      fd;     /* output file descriptor, -1 until opened */
     int      inited;
@@ -436,5 +676,7 @@ static void profiler_atexit(void) {
     }
     mm_unlock();
 }
+
+#endif /* MEM_PROFILE_SELF_CONTAINED */
 
 #endif /* MEM_MANAGER_PROFILE */

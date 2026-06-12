@@ -121,6 +121,66 @@ def load_records(patterns):
     return records, paths, bad
 
 
+# ------------------------------------------------------------- correlate -----
+def correlate(records):
+    """Reconstruct lifetimes / peak-live / never-freed from raw map+unmap
+    events by replaying them per pid in timestamp order, correlating an unmap
+    to its map by address. This makes the report work for BOTH the CP backend
+    (which also writes these inline) and the DP self-contained backend (which
+    records raw events only and leaves correlation to here)."""
+    by_pid = defaultdict(list)
+    for r in records:
+        if r.get("event") in ("map", "map_on_pg", "unmap"):
+            by_pid[r.get("pid")].append(r)
+
+    lifetimes = []      # (size, lifetime_ns, flags)
+    never_freed = []    # (name, size, age_ns, flags)
+    peak_count = peak_bytes = 0
+    matched = unmatched = 0
+
+    for evs in by_pid.values():
+        evs.sort(key=lambda r: r.get("ts_ns", 0))
+        live = {}        # addr -> (size, t_map, name, flags)
+        cur_bytes = 0
+        last_ts = None
+        for r in evs:
+            last_ts = r.get("ts_ns", last_ts)
+            ev = r.get("event")
+            if ev in ("map", "map_on_pg"):
+                if r.get("ret") != 0:
+                    continue
+                addr = r.get("addr")
+                size = r.get("size", 0)
+                if addr in live:          # address reused without an unmap
+                    cur_bytes -= live[addr][0]
+                live[addr] = (size, r.get("ts_ns"), r.get("shmname"), r.get("flags"))
+                cur_bytes += size
+                peak_count = max(peak_count, len(live))
+                peak_bytes = max(peak_bytes, cur_bytes)
+            elif ev == "unmap":
+                addr = r.get("addr")
+                if addr in live:
+                    size, t_map, _name, flags = live.pop(addr)
+                    cur_bytes -= size
+                    matched += 1
+                    if r.get("ts_ns") is not None and t_map is not None:
+                        lifetimes.append((size, r["ts_ns"] - t_map, flags))
+                else:
+                    unmatched += 1
+        for size, t_map, name, flags in live.values():
+            age = (last_ts - t_map) if (last_ts is not None and t_map is not None) else 0
+            never_freed.append((name, size, age, flags))
+
+    return {
+        "lifetimes": lifetimes,
+        "never_freed": never_freed,
+        "peak_count": peak_count,
+        "peak_bytes": peak_bytes,
+        "matched": matched,
+        "unmatched": unmatched,
+    }
+
+
 # ---------------------------------------------------------------- report -----
 def section(title):
     print(f"\n=== {title} ===")
@@ -139,9 +199,12 @@ def main(argv):
     maps = [r for r in records if r.get("event") in ("map", "map_on_pg")]
     ok_maps = [r for r in maps if r.get("ret") == 0]
     unmaps = [r for r in records if r.get("event") == "unmap"]
-    matched_unmaps = [r for r in unmaps if r.get("matched")]
     summaries = [r for r in records if r.get("event") == "summary"]
     leaks = [r for r in records if r.get("event") == "live_at_exit"]
+
+    # Derive lifetimes / peak-live / never-freed by correlating map<->unmap.
+    # Works for both the CP and DP (raw) log schemas.
+    corr = correlate(records)
 
     sizes = [r["size"] for r in ok_maps if "size" in r]
     timestamps = [r["ts_ns"] for r in records if "ts_ns" in r]
@@ -158,7 +221,7 @@ def main(argv):
           f"failed={len(maps) - len(ok_maps)})")
     print(f"    of which on_pg    : {sum(1 for r in maps if r['event'] == 'map_on_pg')}")
     print(f"  unmap calls         : {len(unmaps)}  "
-          f"(matched={len(matched_unmaps)}, unmatched={len(unmaps) - len(matched_unmaps)})")
+          f"(matched={corr['matched']}, unmatched={corr['unmatched']})")
     print(f"  distinct shmnames   : {len({r.get('shmname') for r in ok_maps})}")
     if timestamps:
         span_ns = max(timestamps) - min(timestamps)
@@ -196,16 +259,13 @@ def main(argv):
 
     # -- concurrency / pool-size lower bound -------------------------------
     section("Peak simultaneously-live (pool sizing)")
-    if summaries:
+    print(f"  derived (map/unmap replay): peak_live_count={corr['peak_count']}  "
+          f"peak_live_bytes={human_bytes(corr['peak_bytes'])}")
+    if any("peak_live_count" in s for s in summaries):
         pc_count = max(s.get("peak_live_count", 0) for s in summaries)
         pc_bytes = max(s.get("peak_live_bytes", 0) for s in summaries)
-        print(f"  from summary: peak_live_count={pc_count}  "
+        print(f"  from CP summary           : peak_live_count={pc_count}  "
               f"peak_live_bytes={human_bytes(pc_bytes)}")
-    live_counts = [r["live_count"] for r in records if "live_count" in r]
-    live_bytes = [r["live_bytes"] for r in records if "live_bytes" in r]
-    if live_counts:
-        print(f"  observed across events: max live_count={max(live_counts)}  "
-              f"max live_bytes={human_bytes(max(live_bytes))}")
     print("  -> a single pool only needs ~peak_live_bytes (rounded to pool granularity),")
     print("     vs today's (#distinct live mappings * 2MB).")
 
@@ -223,7 +283,7 @@ def main(argv):
 
     # -- lifetime -----------------------------------------------------------
     section("Lifetime (matched unmaps)")
-    lifetimes = [r["lifetime_ns"] for r in matched_unmaps if "lifetime_ns" in r]
+    lifetimes = [lt for (_sz, lt, _fl) in corr["lifetimes"]]
     if lifetimes:
         pc = percentiles(lifetimes)
         print(f"  count={len(lifetimes)}  p50={human_ns(pc[50])}  p90={human_ns(pc[90])}  "
@@ -237,14 +297,11 @@ def main(argv):
 
     # -- size x lifetime cross-tab -----------------------------------------
     section("Size x lifetime (pooling targets = small + short-lived)")
-    if matched_unmaps:
+    if corr["lifetimes"]:
         cols = ["<1ms", "1ms-1s", ">=1s"]
         grid = defaultdict(lambda: [0, 0, 0])
-        for r in matched_unmaps:
-            if "size" not in r or "lifetime_ns" not in r:
-                continue
-            sl = bucket_label(r["size"], SIZE_BUCKETS, human_bytes)
-            life = r["lifetime_ns"]
+        for size, life, _flags in corr["lifetimes"]:
+            sl = bucket_label(size, SIZE_BUCKETS, human_bytes)
             c = 0 if life < 1e6 else (1 if life < 1e9 else 2)
             grid[sl][c] += 1
         print(f"    {'size \\ life':>16} | {cols[0]:>8} {cols[1]:>8} {cols[2]:>8}")
@@ -288,19 +345,19 @@ def main(argv):
 
     # -- leaks / never-freed ------------------------------------------------
     section("Never-freed at exit (long-lived / leaked)")
-    still = sum(s.get("still_live_at_exit", 0) for s in summaries)
-    print(f"  still_live_at_exit (summary): {still}")
-    if leaks:
-        by_name = Counter(r.get("shmname", "?") for r in leaks)
-        leak_bytes = sum(r.get("size", 0) for r in leaks)
-        print(f"  live_at_exit blocks         : {len(leaks)}, total {human_bytes(leak_bytes)}")
+    never = corr["never_freed"]
+    print(f"  never-freed (derived)       : {len(never)} blocks, "
+          f"total {human_bytes(sum(sz for _n, sz, _a, _f in never))}")
+    if never:
+        by_name = Counter((n or "?") for n, _sz, _a, _f in never)
         for name, n in by_name.most_common(10):
             print(f"    {name}: {n}")
         print("  -> these are the always-resident portion the pool must hold permanently.")
-    unmatched = len(unmaps) - len(matched_unmaps)
-    if unmatched:
-        print(f"  unmatched unmaps            : {unmatched} "
-              "(double-free / freed-before-profiling)")
+    if leaks:  # CP backend also emits explicit live_at_exit lines
+        print(f"  (CP live_at_exit lines      : {len(leaks)})")
+    if corr["unmatched"]:
+        print(f"  unmatched unmaps            : {corr['unmatched']} "
+              "(double-free / freed-before-profiling / pre-capture map)")
 
     print()
     return 0

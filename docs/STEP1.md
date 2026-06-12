@@ -97,3 +97,39 @@ Data-plane (DP) builds must additionally define `MEM_MANAGER_NO_SHMMAPONPG`:
 `Platform_ShmMapOnPg` into a DP `.a` would fail at link with "undefined
 reference to ShmMapOnPg". The macro drops that one wrapper; CP builds leave it
 undefined.
+
+## Two profiler backends (CP vs DP)
+
+The profiler has two backends, selected at compile time, because the DP link
+environment has **no libc and no usable log** (the platform log itself calls
+`ShmMap`, so routing profiler output through it would recurse infinitely).
+
+**CP backend (default).** Normal libc available. Writes JSONL straight to a
+per-process file via `open`/`write`/`close`, resolves lifetimes inline, and
+flushes a `summary` + `live_at_exit` lines at `atexit`. Schema unchanged from
+before.
+
+**DP backend (`-DMEM_PROFILE_SELF_CONTAINED`).** Zero libc, zero log, zero
+allocation on the hot path. Each event is copied into a **fixed static array in
+BSS** under a C11 `atomic_flag` spinlock — the only external symbol it needs is
+`memcpy` (compiler-emitted). The integrator wires it up:
+
+```c
+#include "profiler/shm_profiler.h"
+
+/* 1. inject time + pid (both optional; must NOT call ShmMap) */
+shm_profiler_env env = { dp_now_ns, dp_get_pid };
+shm_profiler_set_env(&env);
+
+/* 2. ... business runs; Platform_ShmMap records into the static buffer ... */
+
+/* 3. at teardown, drain the buffer to a sink you control */
+shm_profiler_dump(my_emit);   /* my_emit(buf,len) -> file / shm / wherever */
+```
+
+Tunables: `MEM_PROFILE_DP_CAPACITY` (default 65536 events; overflow is counted
+and reported as `dropped`) and `MEM_PROFILE_DP_NAMEMAX` (default 48, shmname is
+truncated). The DP backend records **raw** map/unmap events; lifetimes, peak
+simultaneously-live and never-freed are reconstructed offline by
+`analyze_profile.py`, which correlates map↔unmap by address and so handles both
+the CP and DP log schemas.
