@@ -97,19 +97,23 @@ tools/analyze_profile.py             offline analyser (Python 3 stdlib)
 ### Profiler behaviour
 - **Debug-only.** The whole of `shm_profiler.c` is wrapped in
   `#ifdef MEM_MANAGER_PROFILE` (set only in Debug). Release = empty TU: no
-  profiler code, **no pthread dependency** (verified: release links without
-  `-lpthread`).
-- **Thread-safe** (one `pthread_mutex`); negligible vs. a shm syscall.
-- **Per-process file:** `MEM_PROFILE_PATH` (a `%p` token → pid), default
+  profiler code, no dependency at all.
+- **No pthread / no libc lock:** the one lock is a C11 `atomic_flag` spinlock,
+  so the profiler links without `-lpthread` anywhere.
+- **Two backends** (compile-time, because the DP link environment has no libc —
+  see §3 and docs/STEP1.md):
+  - **CP (default):** writes JSONL to a per-process file via `open`/`write`,
+    keeps a live-set hash table to resolve lifetime / peak / leaks inline, and
+    emits `live_at_exit` + `summary` at `atexit`. Records carry
+    `ts_ns, pid, shmname, addr, size, flags, ret` (+ `pgname`), and on unmap
+    `matched` / `lifetime_ns`.
+  - **DP (`-DMEM_PROFILE_VIA_LOG`):** stateless; formats each event as one JSON
+    line and emits it through the OS `LOG_FILE_INFO(module, …)` macro. Time and
+    identity come from the log's own line prefix (wall-clock on CP, `[pg][vcpu]
+    [TSC]` on DP); a single atomic reentrancy flag prevents recursion if a log
+    path calls `ShmMap`. Records are **raw** map/unmap events.
+- **Per-process file (CP):** `MEM_PROFILE_PATH` (a `%p` token → pid), default
   `shm_profile.<pid>.jsonl`.
-- **Records** (JSONL, one object/line): every event carries
-  `pid, live_count, live_bytes, tid`.
-  - `map` / `map_on_pg`: `shmname, addr, size, flags, ret` (+ `pgname`).
-  - `unmap`: `addr, ret, matched`; if matched, `shmname, size, lifetime_ns`.
-  - At exit: one `live_at_exit` per never-freed block, then a `summary`
-    (`peak_live_count/bytes`, total maps/failures/unmaps/unmatched, still-live).
-- **Live set:** open-addressing hash table keyed by address (insert on map,
-  erase on matched unmap) → resolves lifetime, peak concurrency, leaks.
 
 ### Offline analysis (`analyze_profile.py`)
 Aggregates one or many files (glob) and reports: size distribution + percentiles,
@@ -118,6 +122,13 @@ allocation frequency / peak rate, lifetime distribution, **size × lifetime**
 cross-tab (pooling targets = small + short-lived), per-`pgname`/NUMA breakdown,
 **sharing semantics by `flags` with a VA-same/VA-differs rollup**, and
 never-freed/unmatched.
+
+It accepts both schemas: pure JSONL (CP file backend) and OS-log lines (DP
+`VIA_LOG` backend — filter with `--module`, it strips the prefix, extracts the
+`{json}`, and recovers `ts_ns`/identity from `[pg][vcpu][TSC]` or `[date+us]`;
+`--tsc-ghz` converts TSC cycles to ns). Lifetime, peak simultaneously-live and
+never-freed are reconstructed by correlating map↔unmap by address per context,
+so the DP backend can stay a dumb raw-event emitter.
 
 ## 6. Step 2 — direction (not yet built)
 

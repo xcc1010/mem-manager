@@ -98,9 +98,9 @@ Data-plane (DP) builds must additionally define `MEM_MANAGER_NO_SHMMAPONPG`:
 reference to ShmMapOnPg". The macro drops that one wrapper; CP builds leave it
 undefined.
 
-## Three profiler backends (CP vs DP)
+## Two profiler backends (CP vs DP)
 
-The profiler has three backends, selected at compile time, because the DP link
+The profiler has two backends, selected at compile time, because the DP link
 environment has **no libc** (no malloc/stdio/snprintf/open/write under the names
 we'd call — the OS implements its own primitives under internal names).
 
@@ -108,17 +108,17 @@ we'd call — the OS implements its own primitives under internal names).
 per-process file via `open`/`write`/`close`, resolves lifetimes inline, and
 flushes a `summary` + `live_at_exit` lines at `atexit`. Schema unchanged.
 
-**DP via the OS log (`-DMEM_PROFILE_VIA_LOG`).** *Simplest DP integration —
-recommended when the OS log is usable.* Stateless: each event is formatted as a
-single JSON line and handed to the OS `LOG_FILE_INFO(module, fmt, ...)` macro
-(custom module, default `"SHMPROF"`, override with `-DMEM_PROFILE_LOG_MODULE`).
-The payload omits time/pid — the log's own line prefix already carries them
-(wall-clock `+us` on CP, `[pg][vcpu][TSC]` on DP) and `analyze_profile.py`
-recovers them offline. No buffer, no dump, no `set_env`. A single atomic
-reentrancy flag guards against the case where a log path internally calls
-`ShmMap` (it makes the nested call a no-op, which also drops the log's own shm
-allocations from the profile). Assumes single-thread-per-context (true for
-core-bound DP). Only external symbols: `LOG_FILE_INFO` (OS) + `memcpy`.
+**DP via the OS log (`-DMEM_PROFILE_VIA_LOG`).** Stateless: each event is
+formatted as a single JSON line and handed to the OS
+`LOG_FILE_INFO(module, fmt, ...)` macro (custom module, default `"SHMPROF"`,
+override with `-DMEM_PROFILE_LOG_MODULE`). The payload omits time/pid — the
+log's own line prefix already carries them (wall-clock `+us` on CP,
+`[pg][vcpu][TSC]` on DP) and `analyze_profile.py` recovers them offline. No
+buffer, no dump, no init call. A single atomic reentrancy flag guards against
+the case where a log path internally calls `ShmMap` (it makes the nested call a
+no-op, which also drops the log's own shm allocations from the profile).
+Assumes single-thread-per-context (true for core-bound DP). Only external
+symbols: `LOG_FILE_INFO` (OS) + `memcpy`.
 
 Wiring: nothing — defining the macro is enough; events flow to the log. Filter
 them offline by module:
@@ -129,24 +129,7 @@ python tools/analyze_profile.py --module SHMPROF --tsc-ghz 2.5 b.log  # TSC->ns
 python tools/analyze_profile.py --module SHMPROF a.log        # CP (wall-clock)
 ```
 
-**DP self-contained (`-DMEM_PROFILE_SELF_CONTAINED`).** *Fallback when the log
-is unsuitable (too heavy / actually touches shm / no log at all).* Zero libc,
-zero log, zero allocation on the hot path: each event is copied into a **fixed
-static array in BSS** under a C11 `atomic_flag` spinlock — only external symbol
-is `memcpy`. The integrator injects time/pid and drains the buffer:
-
-```c
-shm_profiler_env env = { dp_now_ns, dp_get_pid };   /* both optional */
-shm_profiler_set_env(&env);
-/* ... business runs; events accumulate in the static buffer ... */
-shm_profiler_dump(my_emit);   /* at teardown: my_emit(buf,len) -> your sink */
-```
-
-Tunables: `MEM_PROFILE_DP_CAPACITY` (default 65536 events; overflow counted as
-`dropped`) and `MEM_PROFILE_DP_NAMEMAX` (default 48).
-
-Both DP backends record **raw** map/unmap events; lifetimes, peak
+The DP backend records **raw** map/unmap events; lifetimes, peak
 simultaneously-live and never-freed are reconstructed offline by
 `analyze_profile.py`, which correlates map↔unmap by address (per pid / `[pg]
-[vcpu]` context) and unwraps log-prefixed lines, so it handles all three
-schemas.
+[vcpu]` context) and unwraps log-prefixed lines, so it handles both schemas.
