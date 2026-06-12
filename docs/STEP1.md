@@ -110,6 +110,25 @@ defaults to `IS_CP`; pass `-DIS_DP` to exercise the DP path locally.)
 The parts to hand-port are `src/platform_shm.c` and `src/profiler/*`; the
 `src/os` stub exists only for standalone build/test.
 
+### Enforcing the wrapper (two-header layout)
+
+To guarantee business code can't bypass the wrapper (which the profiler — and
+the Step-2 pool — rely on seeing every allocation), there are two include
+entry points:
+
+| Header | Included by | Sees |
+|--------|-------------|------|
+| `platform/platform_shm.h` + `api.h` (raw) | the wrapper impl `platform_shm.c` | the real `ShmMap` — it must call it |
+| `platform/platform_shm_api.h` (facade) | **business code** | OS constants + `Platform_Shm*`; raw `ShmMap`/`ShmMapOnPg`/`ShmUnmap` are **poisoned** |
+
+The facade re-exports `api.h` (so business gets the OS constants from one
+include) and then `#pragma GCC poison`s the raw calls. Any business file that
+writes `ShmMap(...)` fails to compile (`error: attempt to use poisoned
+'ShmMap'`) and must use `Platform_ShmMap` instead. Because `#pragma GCC poison`
+is per-translation-unit, the wrapper implementation — which does **not** include
+the facade — keeps calling the real OS functions normally. (GCC/Clang only;
+other compilers skip the poison and lose just the compile-time enforcement.)
+
 ## Two profiler backends (CP vs DP)
 
 The profiler has two backends, selected at compile time, because the DP link
