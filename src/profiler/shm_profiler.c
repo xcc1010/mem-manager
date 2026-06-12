@@ -102,6 +102,13 @@ static void lb_ch(LineBuf* lb, char c) {
 }
 
 /* printf-style append for the numeric/format chunks (formatting only). */
+#if defined(__GNUC__)
+#  define MM_PRINTF_FMT(fmt_idx, first_arg) \
+       __attribute__((format(gnu_printf, fmt_idx, first_arg)))
+#else
+#  define MM_PRINTF_FMT(fmt_idx, first_arg)
+#endif
+static void lb_fmt(LineBuf* lb, const char* fmt, ...) MM_PRINTF_FMT(2, 3);
 static void lb_fmt(LineBuf* lb, const char* fmt, ...) {
     char tmp[256];
     va_list ap;
