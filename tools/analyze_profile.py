@@ -20,8 +20,10 @@ Usage:
 Pure standard library; runs on any Python 3.
 """
 
+import calendar
 import glob
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 
@@ -98,8 +100,52 @@ def round_up_2mb(size):
     return ((size + MB2 - 1) // MB2) * MB2
 
 
+# ----------------------------------------------------------- log unwrap ------
+# DP log prefix, e.g. [pg:1][vcpu:1][TSC:0117567917671138][INFO][SHMPROF][f 12]
+_DP_PREFIX = re.compile(r"\[pg:(\d+)\]\[vcpu:(\d+)\]\[TSC:(\d+)\]")
+# CP log prefix, e.g. [INFO][2026/06/12 14:13:03+413339us][SHMPROF][f 12]:
+_CP_PREFIX = re.compile(
+    r"\[(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})\+(\d+)us\]")
+
+
+def unwrap_log(line, module_tag, tsc_ghz):
+    """The VIA_LOG backend emits each event through the OS log macro, so a line
+    looks like '<log prefix>[MODULE]<...> {json}'. Pull out the JSON payload and
+    recover ts_ns + an identity ('pid') from the prefix the log itself stamped:
+    DP carries [pg][vcpu][TSC]; CP carries a wall-clock [date+us]. Returns a
+    record dict, or None if the line is not one of ours."""
+    if module_tag and f"[{module_tag}]" not in line:
+        return None
+    i, j = line.find("{"), line.rfind("}")
+    if i < 0 or j < i:
+        return None
+    try:
+        rec = json.loads(line[i:j + 1])
+    except json.JSONDecodeError:
+        return None
+
+    m = _DP_PREFIX.search(line)
+    if m:
+        pg, vcpu, tsc = m.group(1), m.group(2), int(m.group(3))
+        rec.setdefault("pid", f"pg{pg}.vcpu{vcpu}")
+        # TSC is a cycle counter; convert to ns if the frequency is known,
+        # otherwise keep raw cycles (deltas are still monotonic / comparable).
+        rec.setdefault("ts_ns", int(tsc / tsc_ghz) if tsc_ghz else tsc)
+        rec.setdefault("_clock", "ns" if tsc_ghz else "tsc")
+        return rec
+    m = _CP_PREFIX.search(line)
+    if m:
+        y, mo, d, hh, mm, ss, us = (int(x) for x in m.groups())
+        epoch_s = calendar.timegm((y, mo, d, hh, mm, ss, 0, 0, 0))
+        rec.setdefault("ts_ns", (epoch_s * 1_000_000 + us) * 1000)
+        rec.setdefault("pid", "cp")
+        rec.setdefault("_clock", "ns")
+        return rec
+    return rec  # tagged but no recognised prefix: keep payload as-is
+
+
 # ------------------------------------------------------------------ load -----
-def load_records(patterns):
+def load_records(patterns, module_tag="SHMPROF", tsc_ghz=0.0):
     paths = []
     for pat in patterns:
         hits = glob.glob(pat)
@@ -112,10 +158,16 @@ def load_records(patterns):
                     line = line.strip()
                     if not line:
                         continue
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        bad += 1
+                    if line[0] == "{":          # pure JSONL (CP file / DP dump)
+                        try:
+                            records.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            bad += 1
+                        continue
+                    rec = unwrap_log(line, module_tag, tsc_ghz)   # log-wrapped
+                    if rec is not None:
+                        records.append(rec)
+                    # other (foreign) log lines are silently ignored
         except OSError as exc:
             print(f"  ! cannot read {path}: {exc}", file=sys.stderr)
     return records, paths, bad
@@ -187,14 +239,32 @@ def section(title):
 
 
 def main(argv):
-    if len(argv) < 2:
+    # Minimal flag parsing: --module NAME (VIA_LOG tag, default SHMPROF),
+    # --tsc-ghz G (convert DP TSC cycles to ns). Remaining args are file globs.
+    module_tag, tsc_ghz, patterns = "SHMPROF", 0.0, []
+    it = iter(argv[1:])
+    for a in it:
+        if a == "--module":
+            module_tag = next(it, "SHMPROF")
+        elif a == "--tsc-ghz":
+            tsc_ghz = float(next(it, "0") or 0)
+        elif a.startswith("--"):
+            print(f"unknown flag: {a}", file=sys.stderr)
+            return 1
+        else:
+            patterns.append(a)
+    if not patterns:
         print(__doc__)
         return 1
 
-    records, paths, bad = load_records(argv[1:])
+    records, paths, bad = load_records(patterns, module_tag, tsc_ghz)
     if not records:
         print("No records parsed.", file=sys.stderr)
         return 1
+
+    if any(r.get("_clock") == "tsc" for r in records):
+        print("  NOTE: DP times are raw TSC cycles (pass --tsc-ghz G to convert "
+              "to ns); time-labelled figures below are in cycles for those rows.")
 
     maps = [r for r in records if r.get("event") in ("map", "map_on_pg")]
     ok_maps = [r for r in maps if r.get("ret") == 0]

@@ -1,13 +1,24 @@
 #include "profiler/shm_profiler.h"
 
 /* The entire profiler exists only in Debug builds. In release this file is an
- * empty translation unit: no code, no dependency at all. */
+ * empty translation unit: no code, no dependency at all.
+ *
+ * Three compile-time backends:
+ *   (default)                  CP: writes JSONL to a per-process file (libc).
+ *   MEM_PROFILE_SELF_CONTAINED DP: records into a fixed static BSS array, no
+ *                                  libc/log; drained later via shm_profiler_dump.
+ *   MEM_PROFILE_VIA_LOG        DP: formats each event as one JSON line and hands
+ *                                  it to the OS LOG_FILE_INFO macro. Time and
+ *                                  identity come from the log's own line prefix;
+ *                                  analyze_profile.py unwraps them offline. */
 #ifdef MEM_MANAGER_PROFILE
 
 #include <stdatomic.h>
 #include <stdint.h>
 
-/* Spinlock shared by both backends: lets the profiler need no pthread. */
+/* Spinlock shared by the file/static backends (needs no pthread). The VIA_LOG
+ * backend is stateless and uses a reentrancy flag instead, so it is excluded. */
+#ifndef MEM_PROFILE_VIA_LOG
 static atomic_flag g_lock = ATOMIC_FLAG_INIT;
 
 static void mm_lock(void) {
@@ -19,110 +30,10 @@ static void mm_lock(void) {
 static void mm_unlock(void) {
     atomic_flag_clear_explicit(&g_lock, memory_order_release);
 }
-
-/* ======================================================================== */
-#ifdef MEM_PROFILE_SELF_CONTAINED
-/* ===== Data-plane backend: zero libc, zero log, fixed static buffer ======
- *
- * The DP link environment provides neither libc (malloc/stdio/snprintf under
- * the names we'd call) nor a usable log (the platform log itself calls ShmMap
- * and would recurse). So the hot path here touches NOTHING external: it only
- * takes the spinlock and copies the event into a static array in BSS. Numbers
- * and JSON are produced by hand (no snprintf); time/pid come from injected
- * hooks. Output happens only in shm_profiler_dump(), off the hot path. */
-
-#ifndef MEM_PROFILE_DP_CAPACITY
-#  define MEM_PROFILE_DP_CAPACITY (1u << 16)   /* 65536 events; tune as needed */
-#endif
-#ifndef MEM_PROFILE_DP_NAMEMAX
-#  define MEM_PROFILE_DP_NAMEMAX 48            /* shmname is truncated to this */
 #endif
 
-enum { EV_MAP = 0, EV_MAP_ON_PG = 1, EV_UNMAP = 2 };
-
-typedef struct {
-    long long     ts;
-    const void*   addr;
-    UINT32        size;
-    INT32         flags;
-    INT32         ret;
-    unsigned char ev;
-    char          name[MEM_PROFILE_DP_NAMEMAX];
-} Rec;
-
-/* The whole event log lives in BSS — zero-initialised, no file footprint. */
-static Rec    g_recs[MEM_PROFILE_DP_CAPACITY];
-static size_t g_count;
-static size_t g_dropped;
-
-static struct {
-    long long (*now_ns)(void);
-    int       (*get_pid)(void);
-} g_env = { 0, 0 };
-
-void shm_profiler_set_env(const shm_profiler_env* env) {
-    mm_lock();
-    g_env.now_ns  = env ? env->now_ns  : 0;
-    g_env.get_pid = env ? env->get_pid : 0;
-    mm_unlock();
-}
-
-unsigned long shm_profiler_dropped(void) {
-    return (unsigned long)g_dropped;
-}
-
-static long long env_now(void) {
-    return g_env.now_ns ? g_env.now_ns() : 0;
-}
-
-/* Manual, libc-free string copy with truncation (no strlen/strncpy/memcpy). */
-static void copy_name(char* dst, const char* src) {
-    int i = 0;
-    if (src) {
-        for (; src[i] && i < MEM_PROFILE_DP_NAMEMAX - 1; ++i) {
-            dst[i] = src[i];
-        }
-    }
-    dst[i] = '\0';
-}
-
-void shm_profiler_on_map(const char* op, const char* shmname, const void* addr,
-                         UINT32 size, INT32 flags, INT32 ret, const char* pgname) {
-    (void)op;
-    mm_lock();
-    if (g_count < MEM_PROFILE_DP_CAPACITY) {
-        Rec* r = &g_recs[g_count++];
-        r->ts    = env_now();
-        r->addr  = addr;
-        r->size  = size;
-        r->flags = flags;
-        r->ret   = ret;
-        r->ev    = pgname ? (unsigned char)EV_MAP_ON_PG : (unsigned char)EV_MAP;
-        copy_name(r->name, shmname);
-    } else {
-        ++g_dropped;
-    }
-    mm_unlock();
-}
-
-void shm_profiler_on_unmap(const void* addr, INT32 ret) {
-    mm_lock();
-    if (g_count < MEM_PROFILE_DP_CAPACITY) {
-        Rec* r = &g_recs[g_count++];
-        r->ts      = env_now();
-        r->addr    = addr;
-        r->size    = 0;
-        r->flags   = 0;
-        r->ret     = ret;
-        r->ev      = (unsigned char)EV_UNMAP;
-        r->name[0] = '\0';
-    } else {
-        ++g_dropped;
-    }
-    mm_unlock();
-}
-
-/* ---- libc-free JSONL formatting into a bounded stack buffer ------------- */
+/* ===== libc-free JSON formatting, shared by the two zero-libc backends ===== */
+#if defined(MEM_PROFILE_SELF_CONTAINED) || defined(MEM_PROFILE_VIA_LOG)
 typedef struct {
     char*    b;
     unsigned cap;
@@ -212,6 +123,186 @@ static void b_json(Buf* b, const char* s) {
         }
     }
 }
+#endif /* SELF_CONTAINED || VIA_LOG */
+
+/* ======================================================================== */
+#if defined(MEM_PROFILE_VIA_LOG)
+/* ===== Data-plane backend: emit each event through the OS log macro ======
+ *
+ * Stateless: each call formats a JSON payload on the stack and hands it to
+ * LOG_FILE_INFO. The log line's own prefix carries the timestamp (wall-clock
+ * us on CP, TSC on DP) and identity ([pg][vcpu] on DP), so the payload omits
+ * them; analyze_profile.py reconstructs them from the prefix offline.
+ *
+ * Reentrancy: if any log path internally calls ShmMap, the nested
+ * Platform_ShmMap would re-enter us and recurse. A single atomic flag makes
+ * the nested call a no-op (DP is core-bound / single-threaded-per-context, so
+ * one global flag suffices; it also conveniently drops the log's own shm
+ * allocations from the profile). */
+
+#ifndef MEM_PROFILE_LOG_MODULE
+#  define MEM_PROFILE_LOG_MODULE "SHMPROF"
+#endif
+
+/* In the real build LOG_FILE_INFO comes from the OS headers (via api.h). This
+ * stub is only for the standalone build/test and is never used once the real
+ * macro is in scope. */
+#ifndef LOG_FILE_INFO
+#  include <stdio.h>
+#  define LOG_FILE_INFO(module, fmt, ...) \
+       fprintf(stderr, "[%s] " fmt "\n", (module), __VA_ARGS__)
+#endif
+
+static atomic_int g_in_log;
+
+static void b_finish(Buf* b) {
+    unsigned i = (b->len < b->cap) ? b->len : b->cap - 1;
+    b->b[i] = '\0';
+}
+
+void shm_profiler_on_map(const char* op, const char* shmname, const void* addr,
+                         UINT32 size, INT32 flags, INT32 ret, const char* pgname) {
+    if (atomic_exchange_explicit(&g_in_log, 1, memory_order_acquire)) {
+        return; /* nested call triggered by the log itself */
+    }
+    char buf[512];
+    Buf b = { buf, sizeof buf, 0 };
+    b_str(&b, "{\"event\":\"");
+    b_str(&b, op ? op : "map");
+    b_str(&b, "\",\"shmname\":\"");
+    b_json(&b, shmname);
+    b_str(&b, "\",\"addr\":\"");
+    b_hex(&b, addr);
+    b_str(&b, "\",\"size\":");
+    b_u64(&b, size);
+    b_str(&b, ",\"flags\":");
+    b_i64(&b, flags);
+    b_str(&b, ",\"ret\":");
+    b_i64(&b, ret);
+    if (pgname) {
+        b_str(&b, ",\"pgname\":\"");
+        b_json(&b, pgname);
+        b_ch(&b, '"');
+    }
+    b_str(&b, "}");
+    b_finish(&b);
+    LOG_FILE_INFO(MEM_PROFILE_LOG_MODULE, "%s", b.b);
+    atomic_store_explicit(&g_in_log, 0, memory_order_release);
+}
+
+void shm_profiler_on_unmap(const void* addr, INT32 ret) {
+    if (atomic_exchange_explicit(&g_in_log, 1, memory_order_acquire)) {
+        return;
+    }
+    char buf[128];
+    Buf b = { buf, sizeof buf, 0 };
+    b_str(&b, "{\"event\":\"unmap\",\"addr\":\"");
+    b_hex(&b, addr);
+    b_str(&b, "\",\"ret\":");
+    b_i64(&b, ret);
+    b_str(&b, "}");
+    b_finish(&b);
+    LOG_FILE_INFO(MEM_PROFILE_LOG_MODULE, "%s", b.b);
+    atomic_store_explicit(&g_in_log, 0, memory_order_release);
+}
+
+/* ======================================================================== */
+#elif defined(MEM_PROFILE_SELF_CONTAINED)
+/* ===== Data-plane backend: zero libc, zero log, fixed static buffer ======
+ *
+ * The hot path touches nothing external: it takes the spinlock and copies the
+ * event into a static array in BSS. Output happens only in shm_profiler_dump(),
+ * off the hot path. Time/pid come from injected hooks. */
+
+#ifndef MEM_PROFILE_DP_CAPACITY
+#  define MEM_PROFILE_DP_CAPACITY (1u << 16)   /* 65536 events; tune as needed */
+#endif
+#ifndef MEM_PROFILE_DP_NAMEMAX
+#  define MEM_PROFILE_DP_NAMEMAX 48            /* shmname is truncated to this */
+#endif
+
+enum { EV_MAP = 0, EV_MAP_ON_PG = 1, EV_UNMAP = 2 };
+
+typedef struct {
+    long long     ts;
+    const void*   addr;
+    UINT32        size;
+    INT32         flags;
+    INT32         ret;
+    unsigned char ev;
+    char          name[MEM_PROFILE_DP_NAMEMAX];
+} Rec;
+
+static Rec    g_recs[MEM_PROFILE_DP_CAPACITY];
+static size_t g_count;
+static size_t g_dropped;
+
+static struct {
+    long long (*now_ns)(void);
+    int       (*get_pid)(void);
+} g_env = { 0, 0 };
+
+void shm_profiler_set_env(const shm_profiler_env* env) {
+    mm_lock();
+    g_env.now_ns  = env ? env->now_ns  : 0;
+    g_env.get_pid = env ? env->get_pid : 0;
+    mm_unlock();
+}
+
+unsigned long shm_profiler_dropped(void) {
+    return (unsigned long)g_dropped;
+}
+
+static long long env_now(void) {
+    return g_env.now_ns ? g_env.now_ns() : 0;
+}
+
+/* Manual, libc-free string copy with truncation (no strlen/strncpy/memcpy). */
+static void copy_name(char* dst, const char* src) {
+    int i = 0;
+    if (src) {
+        for (; src[i] && i < MEM_PROFILE_DP_NAMEMAX - 1; ++i) {
+            dst[i] = src[i];
+        }
+    }
+    dst[i] = '\0';
+}
+
+void shm_profiler_on_map(const char* op, const char* shmname, const void* addr,
+                         UINT32 size, INT32 flags, INT32 ret, const char* pgname) {
+    (void)op;
+    mm_lock();
+    if (g_count < MEM_PROFILE_DP_CAPACITY) {
+        Rec* r = &g_recs[g_count++];
+        r->ts    = env_now();
+        r->addr  = addr;
+        r->size  = size;
+        r->flags = flags;
+        r->ret   = ret;
+        r->ev    = pgname ? (unsigned char)EV_MAP_ON_PG : (unsigned char)EV_MAP;
+        copy_name(r->name, shmname);
+    } else {
+        ++g_dropped;
+    }
+    mm_unlock();
+}
+
+void shm_profiler_on_unmap(const void* addr, INT32 ret) {
+    mm_lock();
+    if (g_count < MEM_PROFILE_DP_CAPACITY) {
+        Rec* r = &g_recs[g_count++];
+        r->ts      = env_now();
+        r->addr    = addr;
+        r->size    = 0;
+        r->flags   = 0;
+        r->ret     = ret;
+        r->ev      = (unsigned char)EV_UNMAP;
+        r->name[0] = '\0';
+    } else {
+        ++g_dropped;
+    }
+    mm_unlock();
+}
 
 void shm_profiler_dump(void (*emit)(const char* buf, unsigned len)) {
     if (!emit) {
@@ -266,7 +357,7 @@ void shm_profiler_dump(void (*emit)(const char* buf, unsigned len)) {
 }
 
 /* ======================================================================== */
-#else /* !MEM_PROFILE_SELF_CONTAINED */
+#else /* control-plane file backend */
 /* ===== Control-plane backend: writes JSONL straight to a file ============
  *
  * The CP has a normal libc. Output goes through raw open()/write()/close()
@@ -677,6 +768,6 @@ static void profiler_atexit(void) {
     mm_unlock();
 }
 
-#endif /* MEM_PROFILE_SELF_CONTAINED */
+#endif /* backend selection */
 
 #endif /* MEM_MANAGER_PROFILE */
