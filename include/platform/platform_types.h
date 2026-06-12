@@ -1,7 +1,7 @@
 #ifndef MEM_MANAGER_PLATFORM_TYPES_H
 #define MEM_MANAGER_PLATFORM_TYPES_H
 
-/* INT32 / uint32 come from the business project's internal api.h. For a
+/* INT32 / UINT32 come from the business project's internal api.h. For a
  * standalone build of mem-manager we define compatible aliases here; when
  * integrating, define MEM_MANAGER_USE_API_H so they come from api.h instead.
  * Valid in both C and C++. */
@@ -10,7 +10,7 @@
 #else
 #  include <stdint.h>
 typedef int32_t  INT32;
-typedef uint32_t uint32;
+typedef uint32_t UINT32;
 #endif
 
 #endif /* MEM_MANAGER_PLATFORM_TYPES_H */

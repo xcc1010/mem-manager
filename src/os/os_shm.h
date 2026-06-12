@@ -13,8 +13,8 @@
 extern "C" {
 #  endif
 
-INT32 ShmMap(INT32 flags, char* shmname, uint32 size, void** shm);
-INT32 ShmMapOnPg(INT32 flags, char* pgname, char* shmname, uint32 size, void** shm);
+INT32 ShmMap(INT32 flags, char* shmname, UINT32 size, void** shm);
+INT32 ShmMapOnPg(INT32 flags, char* pgname, char* shmname, UINT32 size, void** shm);
 INT32 ShmUnmap(void* shm);
 
 #  ifdef __cplusplus

@@ -58,7 +58,7 @@ static void json_escape_fputs(FILE* f, const char* s) {
 typedef struct {
     const void* key;   /* mapping address returned by ShmMap */
     char*       name;  /* owned copy of shmname */
-    uint32      size;
+    UINT32      size;
     int64_t     t_map;
     int         state; /* 0 empty, 1 used, 2 tombstone */
 } Entry;
@@ -106,7 +106,7 @@ static void table_grow(Table* t) {
 }
 
 static void table_put(Table* t, const void* key, const char* name,
-                      uint32 size, int64_t t_map) {
+                      UINT32 size, int64_t t_map) {
     if ((t->count + t->tombs) * 4 >= t->cap * 3) {
         table_grow(t);
     }
@@ -224,7 +224,7 @@ static void write_common_tail(FILE* f) {
 
 /* ------------------------------------------------------------- public ---- */
 void shm_profiler_on_map(const char* op, const char* shmname, const void* addr,
-                         uint32 size, INT32 flags, INT32 ret, const char* pgname) {
+                         UINT32 size, INT32 flags, INT32 ret, const char* pgname) {
     pthread_mutex_lock(&g.mu);
     ensure_init();
     if (t_tid == 0) {

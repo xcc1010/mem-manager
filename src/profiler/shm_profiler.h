@@ -21,7 +21,7 @@ extern "C" {
  * the call failed. op is "map" or "map_on_pg"; pgname is non-NULL only for
  * map_on_pg. */
 void shm_profiler_on_map(const char* op, const char* shmname, const void* addr,
-                         uint32 size, INT32 flags, INT32 ret, const char* pgname);
+                         UINT32 size, INT32 flags, INT32 ret, const char* pgname);
 
 /* Record an unmap by address; the matching shmname / size / lifetime are
  * resolved from the live set populated by shm_profiler_on_map. */

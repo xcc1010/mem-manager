@@ -47,8 +47,8 @@ Consequences:
 
 | Wrapper                | OS call      | Signature |
 |------------------------|--------------|-----------|
-| `Platform_ShmMap`      | `ShmMap`     | `INT32(INT32 flags, char* shmname, uint32 size, void** shm)` |
-| `Platform_ShmMapOnPg`  | `ShmMapOnPg` | `INT32(INT32 flags, char* pgname, char* shmname, uint32 size, void** shm)` |
+| `Platform_ShmMap`      | `ShmMap`     | `INT32(INT32 flags, char* shmname, UINT32 size, void** shm)` |
+| `Platform_ShmMapOnPg`  | `ShmMapOnPg` | `INT32(INT32 flags, char* pgname, char* shmname, UINT32 size, void** shm)` |
 | `Platform_ShmUnmap`    | `ShmUnmap`   | `INT32(void* shm)` |
 
 - Return code `0` = success (assumed).
@@ -87,7 +87,7 @@ pass straight through to `ShmMap` unpooled in v1.
 ### Components (all C)
 ```
 include/platform/platform_shm.h     public API (extern "C")
-include/platform/platform_types.h   INT32/uint32 (stdint; swap for api.h)
+include/platform/platform_types.h   INT32/UINT32 (stdint; swap for api.h)
 src/platform_shm.c                   the three wrappers (pass-through + profile)
 src/os/os_shm.h, os_shm_stub.c       OS decls + heap stub (standalone only)
 src/profiler/shm_profiler.{h,c}      thread-safe JSONL profiler
@@ -144,6 +144,11 @@ Informed by Step-1 data:
 
 - Hand-port `src/platform_shm.c` and `src/profiler/*`; `src/os/*` is only the
   standalone stub.
-- Build with `-DMEM_MANAGER_USE_API_H=ON` so `INT32`/`uint32` and the OS `Shm*`
+- Build with `-DMEM_MANAGER_USE_API_H=ON` so `INT32`/`UINT32` and the OS `Shm*`
   come from the internal `api.h`.
 - Enable `MEM_MANAGER_PROFILE` in the platform's Debug build to capture profiles.
+- **DP builds must define `MEM_MANAGER_NO_SHMMAPONPG`.** `ShmMapOnPg` is only
+  provided in the control-plane link environment; the DP toolchain has no such
+  symbol. The macro compiles `Platform_ShmMapOnPg` (and its reference to the OS
+  `ShmMapOnPg`) out entirely, so linking the DP `.a` does not fail with
+  "undefined reference to ShmMapOnPg". CP builds leave it undefined.

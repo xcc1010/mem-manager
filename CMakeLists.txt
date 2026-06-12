@@ -14,7 +14,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 
-# When ON, INT32/uint32 and the OS Shm* functions come from the business api.h
+# When ON, INT32/UINT32 and the OS Shm* functions come from the business api.h
 # instead of mem-manager's standalone shims + heap stub.
 option(MEM_MANAGER_USE_API_H "Pull types and OS Shm* from the real api.h" OFF)
 option(MEM_MANAGER_BUILD_TESTS "Build unit tests" ON)

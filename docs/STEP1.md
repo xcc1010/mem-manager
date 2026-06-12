@@ -16,8 +16,8 @@ pthread dependency.
 
 | Wrapper                  | OS call      | Signature |
 |--------------------------|--------------|-----------|
-| `Platform_ShmMap`        | `ShmMap`     | `INT32(INT32 flags, char* shmname, uint32 size, void** shm)` |
-| `Platform_ShmMapOnPg`    | `ShmMapOnPg` | `INT32(INT32 flags, char* pgname, char* shmname, uint32 size, void** shm)` |
+| `Platform_ShmMap`        | `ShmMap`     | `INT32(INT32 flags, char* shmname, UINT32 size, void** shm)` |
+| `Platform_ShmMapOnPg`    | `ShmMapOnPg` | `INT32(INT32 flags, char* pgname, char* shmname, UINT32 size, void** shm)` |
 | `Platform_ShmUnmap`      | `ShmUnmap`   | `INT32(void* shm)` |
 
 `ShmUnmap` receives only the address, so map events are correlated to their
@@ -87,7 +87,13 @@ python tools/analyze_profile.py "logs/*.jsonl"   # aggregate many processes
 ## Integration
 
 When wiring into the business project, configure with
-`-DMEM_MANAGER_USE_API_H=ON` so `INT32`/`uint32` and the OS `Shm*` functions are
+`-DMEM_MANAGER_USE_API_H=ON` so `INT32`/`UINT32` and the OS `Shm*` functions are
 taken from the internal `api.h` instead of the standalone shims and heap stub.
-The parts to hand-port are `src/platform_shm.cpp` and `src/profiler/*`; the
+The parts to hand-port are `src/platform_shm.c` and `src/profiler/*`; the
 `src/os` stub exists only for standalone build/test.
+
+Data-plane (DP) builds must additionally define `MEM_MANAGER_NO_SHMMAPONPG`:
+`ShmMapOnPg` is a control-plane-only OS symbol, so compiling
+`Platform_ShmMapOnPg` into a DP `.a` would fail at link with "undefined
+reference to ShmMapOnPg". The macro drops that one wrapper; CP builds leave it
+undefined.

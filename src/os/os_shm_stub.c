@@ -5,7 +5,7 @@
 
 #include <stdlib.h>
 
-INT32 ShmMap(INT32 flags, char* shmname, uint32 size, void** shm) {
+INT32 ShmMap(INT32 flags, char* shmname, UINT32 size, void** shm) {
     (void)flags;
     (void)shmname;
     if (!shm) {
@@ -15,7 +15,7 @@ INT32 ShmMap(INT32 flags, char* shmname, uint32 size, void** shm) {
     return *shm ? 0 : -1;
 }
 
-INT32 ShmMapOnPg(INT32 flags, char* pgname, char* shmname, uint32 size, void** shm) {
+INT32 ShmMapOnPg(INT32 flags, char* pgname, char* shmname, UINT32 size, void** shm) {
     (void)pgname; /* the stub ignores numa placement */
     return ShmMap(flags, shmname, size, shm);
 }
