@@ -107,7 +107,7 @@ tools/analyze_profile.py             offline analyser (Python 3 stdlib)
     emits `live_at_exit` + `summary` at `atexit`. Records carry
     `ts_ns, pid, shmname, addr, size, flags, ret` (+ `pgname`), and on unmap
     `matched` / `lifetime_ns`.
-  - **DP (`-DMEM_PROFILE_VIA_LOG`):** stateless; formats each event as one JSON
+  - **DP (selected by `MEM_MANAGER_DP`):** stateless; formats each event as one JSON
     line and emits it through the OS `LOG_FILE_INFO(module, …)` macro. Time and
     identity come from the log's own line prefix (wall-clock on CP, `[pg][vcpu]
     [TSC]` on DP); a single atomic reentrancy flag prevents recursion if a log
@@ -158,8 +158,8 @@ Informed by Step-1 data:
 - Build with `-DMEM_MANAGER_USE_API_H=ON` so `INT32`/`UINT32` and the OS `Shm*`
   come from the internal `api.h`.
 - Enable `MEM_MANAGER_PROFILE` in the platform's Debug build to capture profiles.
-- **DP builds must define `MEM_MANAGER_NO_SHMMAPONPG`.** `ShmMapOnPg` is only
-  provided in the control-plane link environment; the DP toolchain has no such
-  symbol. The macro compiles `Platform_ShmMapOnPg` (and its reference to the OS
-  `ShmMapOnPg`) out entirely, so linking the DP `.a` does not fail with
-  "undefined reference to ShmMapOnPg". CP builds leave it undefined.
+- **DP builds add one flag: `MEM_MANAGER_DP`.** It marks the data plane and
+  derives both DP-specific behaviours: drop `Platform_ShmMapOnPg` (a CP-only OS
+  symbol — otherwise the DP `.a` fails at link with "undefined reference to
+  ShmMapOnPg") and select the log-based profiler backend (DP has no libc). CP
+  builds define nothing extra. See docs/STEP1.md for the full flag table.

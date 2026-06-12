@@ -84,19 +84,33 @@ python tools/analyze_profile.py shm_profile.jsonl
 python tools/analyze_profile.py "logs/*.jsonl"   # aggregate many processes
 ```
 
-## Integration
+## Integration — build flags
 
-When wiring into the business project, configure with
-`-DMEM_MANAGER_USE_API_H=ON` so `INT32`/`UINT32` and the OS `Shm*` functions are
-taken from the internal `api.h` instead of the standalone shims and heap stub.
+Three knobs, set once per build config:
+
+| Macro | When | Effect |
+|-------|------|--------|
+| `MEM_MANAGER_USE_API_H` | always (real integration) | `INT32`/`UINT32` and the OS `Shm*` come from the internal `api.h` instead of the standalone shims + heap stub |
+| `MEM_MANAGER_PROFILE` | debug builds | turns the profiler on (release = empty TU, pure pass-through) |
+| `MEM_MANAGER_DP` | data-plane builds only | marks the DP plane — see below |
+
+So a **CP** build is `-DMEM_MANAGER_USE_API_H [-DMEM_MANAGER_PROFILE]`; a **DP**
+build adds exactly one flag: `-DMEM_MANAGER_DP`.
+
+`MEM_MANAGER_DP` exists because the DP link environment differs from CP in two
+ways that always go together, so one switch derives both:
+- `ShmMapOnPg` is a control-plane-only OS symbol — compiling
+  `Platform_ShmMapOnPg` into a DP `.a` would fail at link with "undefined
+  reference to ShmMapOnPg". DP drops that one wrapper.
+- DP has no libc, so the profiler can't use the file backend; DP selects the
+  log backend instead.
+
+(The fine-grained macros `MEM_MANAGER_NO_SHMMAPONPG` and `MEM_PROFILE_VIA_LOG`
+still work on their own if you ever need an unusual combination; `MEM_MANAGER_DP`
+just defines both.)
+
 The parts to hand-port are `src/platform_shm.c` and `src/profiler/*`; the
 `src/os` stub exists only for standalone build/test.
-
-Data-plane (DP) builds must additionally define `MEM_MANAGER_NO_SHMMAPONPG`:
-`ShmMapOnPg` is a control-plane-only OS symbol, so compiling
-`Platform_ShmMapOnPg` into a DP `.a` would fail at link with "undefined
-reference to ShmMapOnPg". The macro drops that one wrapper; CP builds leave it
-undefined.
 
 ## Two profiler backends (CP vs DP)
 
@@ -108,7 +122,7 @@ we'd call — the OS implements its own primitives under internal names).
 per-process file via `open`/`write`/`close`, resolves lifetimes inline, and
 flushes a `summary` + `live_at_exit` lines at `atexit`. Schema unchanged.
 
-**DP via the OS log (`-DMEM_PROFILE_VIA_LOG`).** Stateless: each event is
+**DP via the OS log (selected by `MEM_MANAGER_DP`).** Stateless: each event is
 formatted as a single JSON line and handed to the OS
 `LOG_FILE_INFO(module, fmt, ...)` macro (custom module, default `"SHMPROF"`,
 override with `-DMEM_PROFILE_LOG_MODULE`). The payload omits time/pid — the
