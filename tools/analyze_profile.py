@@ -108,6 +108,56 @@ _CP_PREFIX = re.compile(
     r"\[(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})\+(\d+)us\]")
 
 
+_NIL_ADDR = {"", "0", "0x0", "(nil)"}
+
+
+def _addr_is_real(addr):
+    """True if addr is a usable mapping address (not null / (nil) / all-zero)."""
+    if not addr:
+        return False
+    a = str(addr).strip().lower()
+    if a in _NIL_ADDR:
+        return False
+    if a.startswith("0x"):
+        a = a[2:]
+    return a.strip("0") != ""
+
+
+def _map_ok(r):
+    """A map 'succeeded' if ret >= 0. The success code differs by plane: DP
+    returns 0, CP returns the shm reference count (>0); ret < 0 is failure on
+    both. (Earlier code assumed 0 == success, which dropped every CP map.)"""
+    return r.get("ret", 0) >= 0
+
+
+def _json_object_end(s, start):
+    """Given s[start] == '{', return the index just past the matching '}',
+    tracking string context so a brace inside a JSON string doesn't end it
+    early. This lets us recover our payload even when the underlying logger
+    (not line-atomic under load) appends another log's text after ours."""
+    depth = 0
+    in_str = False
+    esc = False
+    for k in range(start, len(s)):
+        c = s[k]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return k + 1
+    return -1
+
+
 def unwrap_log(line, module_tag, tsc_ghz):
     """The VIA_LOG backend emits each event through the OS log macro, so a line
     looks like '<log prefix>[MODULE]<...> {json}'. Pull out the JSON payload and
@@ -116,11 +166,14 @@ def unwrap_log(line, module_tag, tsc_ghz):
     record dict, or None if the line is not one of ours."""
     if module_tag and f"[{module_tag}]" not in line:
         return None
-    i, j = line.find("{"), line.rfind("}")
-    if i < 0 or j < i:
+    i = line.find("{")
+    if i < 0:
+        return None
+    end = _json_object_end(line, i)   # tolerate trailing foreign log text
+    if end < 0:
         return None
     try:
-        rec = json.loads(line[i:j + 1])
+        rec = json.loads(line[i:end])
     except json.JSONDecodeError:
         return None
 
@@ -199,9 +252,11 @@ def correlate(records):
             last_ts = r.get("ts_ns", last_ts)
             ev = r.get("event")
             if ev in ("map", "map_on_pg"):
-                if r.get("ret") != 0:
+                if not _map_ok(r):        # ret < 0 = failure (both planes)
                     continue
                 addr = r.get("addr")
+                if not _addr_is_real(addr):   # need a real address as the key
+                    continue
                 size = r.get("size", 0)
                 if addr in live:          # address reused without an unmap
                     cur_bytes -= live[addr][0]
@@ -267,7 +322,7 @@ def main(argv):
               "to ns); time-labelled figures below are in cycles for those rows.")
 
     maps = [r for r in records if r.get("event") in ("map", "map_on_pg")]
-    ok_maps = [r for r in maps if r.get("ret") == 0]
+    ok_maps = [r for r in maps if _map_ok(r)]
     unmaps = [r for r in records if r.get("event") == "unmap"]
     summaries = [r for r in records if r.get("event") == "summary"]
     leaks = [r for r in records if r.get("event") == "live_at_exit"]

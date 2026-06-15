@@ -504,11 +504,15 @@ void shm_profiler_on_map(const char* op, const char* shmname, const void* addr,
     }
     int64_t t = now_ns();
 
+    /* Success convention differs by plane: DP returns ret==0, CP returns
+     * ret>0 (the value is the shm reference count); ret<0 is failure on both.
+     * So treat ret>=0 as success. ret is recorded as-is (it carries the CP
+     * reference count). */
     ++g.total_map_calls;
-    if (ret != 0) {
+    if (ret < 0) {
         ++g.total_map_failures;
     }
-    if (ret == 0 && addr) {
+    if (ret >= 0 && addr) {
         table_put(&g.live, addr, shmname, size, t);
         g.live_bytes += size;
         if (g.live.count > g.peak_count) {
