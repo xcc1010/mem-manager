@@ -429,7 +429,8 @@ def main(argv):
             sl = bucket_label(size, SIZE_BUCKETS, human_bytes)
             c = 0 if life < 1e6 else (1 if life < 1e9 else 2)
             grid[sl][c] += 1
-        print(f"    {'size \\ life':>16} | {cols[0]:>8} {cols[1]:>8} {cols[2]:>8}")
+        hdr = "size \\ life"   # kept out of the f-string: backslashes in an
+        print(f"    {hdr:>16} | {cols[0]:>8} {cols[1]:>8} {cols[2]:>8}")
         for e in [0] + SIZE_BUCKETS:
             sl = bucket_label(e, SIZE_BUCKETS, human_bytes)
             if sl in grid:
