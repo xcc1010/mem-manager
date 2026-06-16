@@ -31,6 +31,10 @@ compile_commands.json
 .idea/
 *.user
 
+# Python (analysis tools)
+__pycache__/
+*.pyc
+
 # OS
 .DS_Store
 Thumbs.db
