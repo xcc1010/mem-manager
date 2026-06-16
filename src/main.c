@@ -11,7 +11,7 @@ int main(void) {
 
     INT32 ret = Platform_ShmMap(0, name, 4096, &p);
     printf("Platform_ShmMap ret=%d addr=%p\n", (int)ret, p);
-    if (ret != 0) {
+    if (ret < 0) {   /* success returns the reference count (>0); failure < 0 */
         return 1;
     }
 

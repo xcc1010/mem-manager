@@ -12,7 +12,10 @@ INT32 ShmMap(INT32 flags, char* shmname, UINT32 size, void** shm) {
         return -1;
     }
     *shm = malloc(size);
-    return *shm ? 0 : -1;
+    /* Mirror the real OS convention: success returns a reference count (>0),
+     * failure returns <0. (Returning 0 here previously masked the fact that
+     * both planes use ret>0 for success.) */
+    return *shm ? 1 : -1;
 }
 
 INT32 ShmMapOnPg(INT32 flags, char* pgname, char* shmname, UINT32 size, void** shm) {

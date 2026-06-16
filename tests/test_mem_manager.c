@@ -24,7 +24,7 @@ int main(void) {
     void* p = NULL;
     char name[] = "test/block";
     INT32 ret = Platform_ShmMap(0, name, 256, &p);
-    assert(ret == 0);
+    assert(ret >= 0);   /* success returns the reference count (>0) */
     assert(p != NULL);
     memset(p, 0xAB, 256);
     assert(*(unsigned char*)p == 0xAB);
@@ -34,7 +34,7 @@ int main(void) {
     char name2[] = "test/onpg";
     char pg[] = "pg0";
     ret = Platform_ShmMapOnPg(0, pg, name2, 128, &q);
-    assert(ret == 0);
+    assert(ret >= 0);   /* success returns the reference count (>0) */
     assert(q != NULL);
     assert(Platform_ShmUnmap(q) == 0);
 
