@@ -381,6 +381,39 @@ def main(argv):
         print(f"  cumulative OS cost (n*2MB)   : {human_bytes(os_cost)}")
         print(f"  cumulative waste            : {human_bytes(os_cost - requested)} "
               f"({100.0 * (os_cost - requested) / os_cost:.1f}% of OS cost)")
+        print("  NOTE: 'cumulative' sums every map event. A region shared by N "
+              "contexts is\n        mapped N times, so this counts mappings, not "
+              "physical memory - see next.")
+
+    # -- distinct regions (dedup by shmname = physical footprint) ----------
+    section("Distinct regions (dedup by shmname = physical footprint)")
+    by_name = {}
+    for r in ok_maps:
+        name = r.get("shmname")
+        if not name:
+            continue
+        e = by_name.setdefault(name, {"size": 0, "maps": 0})
+        e["maps"] += 1
+        e["size"] = max(e["size"], r.get("size", 0))
+    if by_name:
+        distinct_bytes = sum(v["size"] for v in by_name.values())
+        distinct_oscost = sum(round_up_2mb(v["size"]) for v in by_name.values())
+        total_maps = sum(v["maps"] for v in by_name.values())
+        print(f"  distinct regions (by name)  : {len(by_name)}")
+        print(f"  distinct bytes (each once)  : {human_bytes(distinct_bytes)}  "
+              f"<- ~real physical memory requested")
+        print(f"  distinct OS cost (n*2MB)    : {human_bytes(distinct_oscost)}  "
+              f"(waste {human_bytes(distinct_oscost - distinct_bytes)})")
+        print(f"  total mappings of them      : {total_maps}  "
+              f"(avg sharing {total_maps / len(by_name):.1f}x per region)")
+        shared = sorted(by_name.items(), key=lambda kv: -kv[1]["maps"])
+        shown = [(n, v) for n, v in shared if v["maps"] > 1][:8]
+        if shown:
+            print("  most-shared regions (mappings x size):")
+            for n, v in shown:
+                print(f"    {n}: {v['maps']} x {human_bytes(v['size'])}")
+        print("  -> compare 'distinct bytes' with what you think you allocate; the")
+        print("     gap vs cumulative is the sharing factor, not extra memory.")
 
     # -- concurrency / pool-size lower bound -------------------------------
     section("Peak simultaneously-live (pool sizing)")
