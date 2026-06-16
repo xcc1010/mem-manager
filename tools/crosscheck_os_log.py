@@ -180,7 +180,7 @@ def main(argv):
     print(f"  aligned   : profiler {ap.human_bytes(pr_al):>10}   OS {ap.human_bytes(os_al):>10}")
 
     ok = not missing and not extra and not size_mismatch and not align_mismatch
-    print("\nRESULT:", "MATCH — profiler agrees with the OS log." if ok
+    print("\nRESULT:", "MATCH - profiler agrees with the OS log." if ok
           else "DIFFERENCES found (see above).")
     return 0 if ok else 1
 

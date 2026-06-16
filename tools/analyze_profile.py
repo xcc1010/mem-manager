@@ -23,6 +23,7 @@ Pure standard library; runs on any Python 3.
 import calendar
 import glob
 import json
+import os
 import re
 import sys
 from collections import Counter, defaultdict
@@ -201,12 +202,16 @@ def unwrap_log(line, module_tag, tsc_ghz):
 def load_records(patterns, module_tag="SHMPROF", tsc_ghz=0.0):
     paths = []
     for pat in patterns:
+        if os.path.isdir(pat):                 # a directory -> every file under it
+            for root, _dirs, files in os.walk(pat):
+                paths.extend(os.path.join(root, f) for f in sorted(files))
+            continue
         hits = glob.glob(pat)
         paths.extend(hits if hits else [pat])
     records, bad = [], 0
     for path in paths:
         try:
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
