@@ -102,6 +102,9 @@ def main(argv):
     ap_.add_argument("--tsc-ghz", type=float, default=0.0)
     ap_.add_argument("--req-hex", action="store_true",
                      help="OS requested-size column is hex without 0x")
+    ap_.add_argument("--captured-only", action="store_true",
+                     help="only validate regions our profiler captured (scope the "
+                          "OS log to our shmnames); skip OS-only 'missing' detection")
     ap_.add_argument("profiles", nargs="+", help="our profiler logs / JSONL")
     a = ap_.parse_args(argv[1:])
 
@@ -114,6 +117,11 @@ def main(argv):
     os_r = {n: v for n, v in os_all.items() if keep(n)}
     prof_all, paths = load_profiler_regions(a.profiles, a.module, a.tsc_ghz)
     pr = {n: v for n, v in prof_all.items() if keep(n)}
+
+    # Validate only what we captured: scope the OS log to our shmnames, so its
+    # other (whole-machine) regions don't show up as 'missing'.
+    if a.captured_only:
+        os_r = {n: v for n, v in os_r.items() if n in pr}
 
     print(f"OS log         : {a.os}  ({len(os_all)} regions, {len(os_r)} after filter"
           + (f", {bad} unparsed lines" if bad else "") + ")")
