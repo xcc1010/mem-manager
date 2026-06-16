@@ -38,19 +38,35 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import analyze_profile as ap   # reuse load_records / _map_ok
 
 
-def _num(s, req_hex=False):
-    s = s.strip()
-    if s.lower().startswith("0x"):
-        return int(s, 16)
-    return int(s, 16) if req_hex else int(s)
-
-
 _TS = re.compile(r"^\s*\[[^\]]*\]\s*")
 
 
+def _to_int(tok, force_hex):
+    t = tok.strip()
+    if t.lower().startswith("0x"):
+        return int(t, 16)
+    return int(t, 16) if force_hex else int(t)
+
+
+def _col_is_hex(tokens):
+    """A numeric column is hex if any value carries a 0x prefix or an a-f digit.
+    You can't mix bases within one column, so a single hex value (e.g. 'b624')
+    means the whole column is hex — including the all-digit values ('200000' is
+    then 0x200000, not decimal 200000)."""
+    for t in tokens:
+        tl = t.strip().lower()
+        if tl.startswith("0x") or any(c in "abcdef" for c in tl):
+            return True
+    return False
+
+
 def parse_os_log(path, req_hex):
-    """name -> {'req', 'aligned', 'addr', 'count'} (max size kept per name)."""
-    regions, bad = {}, 0
+    """name -> {'req','aligned','addr','count'}; returns (regions, bad, size_hex).
+
+    The size and aligned columns are auto-detected as hex or decimal per column
+    (overridable for size via --req-hex), so a log that writes hex without a 0x
+    prefix and mixes all-digit / a-f values just works."""
+    rows, bad = [], 0
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = _TS.sub("", line.strip())
@@ -60,20 +76,23 @@ def parse_os_log(path, req_hex):
             if len(toks) < 4:
                 bad += 1
                 continue
-            try:
-                addr = toks[0]
-                req = _num(toks[1], req_hex)
-                aligned = _num(toks[2])
-                name = toks[-1]
-            except ValueError:
-                bad += 1
-                continue
-            e = regions.setdefault(name, {"req": 0, "aligned": 0,
-                                          "addr": addr, "count": 0})
-            e["count"] += 1
-            e["req"] = max(e["req"], req)
-            e["aligned"] = max(e["aligned"], aligned)
-    return regions, bad
+            rows.append((toks[0], toks[1], toks[2], toks[-1]))  # addr size align name
+    size_hex = req_hex or _col_is_hex([r[1] for r in rows])
+    align_hex = _col_is_hex([r[2] for r in rows])
+    regions = {}
+    for addr, s, al, name in rows:
+        try:
+            req = _to_int(s, size_hex)
+            aligned = _to_int(al, align_hex)
+        except ValueError:
+            bad += 1
+            continue
+        e = regions.setdefault(name, {"req": 0, "aligned": 0,
+                                      "addr": addr, "count": 0})
+        e["count"] += 1
+        e["req"] = max(e["req"], req)
+        e["aligned"] = max(e["aligned"], aligned)
+    return regions, bad, size_hex
 
 
 def load_profiler_regions(profiles, module_tag, tsc_ghz):
@@ -101,7 +120,8 @@ def main(argv):
     ap_.add_argument("--module", default="SHMPROF", help="DP log module tag")
     ap_.add_argument("--tsc-ghz", type=float, default=0.0)
     ap_.add_argument("--req-hex", action="store_true",
-                     help="OS requested-size column is hex without 0x")
+                     help="force the OS size column to hex (auto-detected "
+                          "otherwise; use this only if every size is all-digit hex)")
     ap_.add_argument("--captured-only", action="store_true",
                      help="only validate regions our profiler captured (scope the "
                           "OS log to our shmnames); skip OS-only 'missing' detection")
@@ -113,7 +133,7 @@ def main(argv):
     def keep(name):
         return pat.search(name) is not None if pat else True
 
-    os_all, bad = parse_os_log(a.os, a.req_hex)
+    os_all, bad, size_hex = parse_os_log(a.os, a.req_hex)
     os_r = {n: v for n, v in os_all.items() if keep(n)}
     prof_all, paths = load_profiler_regions(a.profiles, a.module, a.tsc_ghz)
     pr = {n: v for n, v in prof_all.items() if keep(n)}
@@ -123,7 +143,8 @@ def main(argv):
     if a.captured_only:
         os_r = {n: v for n, v in os_r.items() if n in pr}
 
-    print(f"OS log         : {a.os}  ({len(os_all)} regions, {len(os_r)} after filter"
+    print(f"OS log         : {a.os}  ({len(os_all)} regions, {len(os_r)} after "
+          f"filter, size column = {'hex' if size_hex else 'decimal'}"
           + (f", {bad} unparsed lines" if bad else "") + ")")
     print(f"profiler logs  : {', '.join(paths)}  "
           f"({len(prof_all)} regions, {len(pr)} after filter)")
