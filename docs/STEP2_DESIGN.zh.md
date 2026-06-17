@@ -50,14 +50,12 @@
 - **按 NUMA/pgname 分**：`ShmMapOnPg` 要求内存落在指定 NUMA 节点，所以 OnPg 的池块要按节点分别申请。
 - **按 size_class 分**：slab 要求同一池块内槽大小固定。
 
-### 2.2 元数据放共享内存、**跨进程**访问 【待拍板】
-- 注册表 / free list / 池块表 都在一块**元数据 shm**（固定名字、VA-same）里。
+### 2.2 元数据放共享内存、跨进程访问
+- 注册表 / 池块表 都在一块**元数据 shm**（固定名字、VA-same）里。
 - CP 和各 DP 进程都 attach 到**同一份** → 这样"同名 attach 拿同一槽"才成立。
-- ⇒ 并发是**跨进程**的：锁是放在这块共享内存里的**自旋锁**（对共享内存做原子操作跨进程有效）。
-- ⚠️ **最大风险点**：持锁进程崩溃 → 死锁 / 状态不一致；refcount 可能泄漏。
-  - **【待拍板 A】** 你们是否 **CP 和 DP 都会调用 `ShmMap` 申请新区域**？
-    - 若**都会** → 必须跨进程共享分配器（本设计，复杂、有崩溃风险）；
-    - 若**只有 CP 申请、DP 只 attach** → 可大幅简化为"单写者"（DP 仅查表+refcount），强烈推荐。
+- **【已定 A】CP 和 DP 都能申请新区域**（DP 的小块占浪费大头，必须也能池化）。
+- 并发模型见 §2.5：**单一共享池**（打包最密、最省内存）+ **`TrySpinLock`（拿不到就兜底透传，永不死锁）** + **原子引用计数**。
+  （否决了"每进程 arena"：它会牺牲打包密度，违背省内存的初衷。）
 
 ### 2.3 `unmap` 只给地址 → 地址反查槽
 池块是大的对齐区域。`Platform_ShmUnmap(addr)`：
@@ -68,6 +66,40 @@
 
 ### 2.4 只池化 VA-same 才能发裸指针
 池块用 **VA-same flags** 申请 → 所有进程看到同一 VA → 块内槽地址跨进程稳定 → 可直接发裸指针、可在共享内存里存指针。这正是"只池化 VA-same"的根因。VA-differs 要用偏移，v1 不池化、直接透传。
+
+### 2.5 并发与多进程模型（已定，核心）
+**模型：单一共享池**（打包最密、最省内存）。CP/DP 都能申请。用 DP 现成的**自旋锁 + 原子**协调。
+
+**(1) 创建路径**（切槽 / 建新池块 / 名字表插入·删除）—— 跨进程**自旋锁**保护，但用 **`TrySpinLock` + 有限重试**：
+- 拿到 → 做结构性修改 → `SpinUnlock`；
+- 拿不到（持锁者卡住/崩溃）→ **兜底透传 OS `ShmMap`**。**永不死锁**，最坏退化为"这次不池化"，系统照跑。
+- ⇒ **锁是否崩溃健壮不影响安全性**（不依赖它）。
+
+**(2) 临界区极小**：新池块的 OS `ShmMap`（慢、可能阻塞）在**锁外**做好，锁内只做几行赋值/链表操作（纳秒级）→ 崩溃窗口极小。且创建属 init-once，稳态几乎不触发。
+
+**(3) attach 路径无锁（性能关键）**：业务频繁 map 一块**已存在**的共享区域（attach），不应争全局锁：
+- 名字表项**插入**在锁内完成，**最后一步**用 release 原子写置 `state=USED`；
+- **查表**用 acquire 原子读 `state`，读到 `USED` 才用（保证看到完整项）；
+- **引用计数**用原子自加/自减。
+- ⇒ **attach = 无锁查表 + 原子 refcount，不碰全局锁** → 对"性能严格"友好。
+- 注：这只是"表项就绪位的原子发布"，池仍是**单一共享池、打包密**，与被否的"每进程 arena"无关。
+  若更想要极简，也可把查表放进锁内（代价：attach 也争锁）。
+
+**(4) NUMA**：部署固定、消费者大多同节点 → 池块放在**该公共节点**；OnPg 路径**按节点分池**。均由配置静态指定。
+
+**(5) 释放**：detach 用原子自减；减到 0 时置 `state=TOMBSTONE`（不立刻动 free list）；
+切槽方持锁时顺带回收墓碑槽。init-once/shutdown-free 下几乎只在收尾回收。
+
+**用 DP 原语实现**：
+
+| 角色 | 原语 | 内存序 |
+|---|---|---|
+| 创建路径互斥（切槽/建块/名字增删） | `TrySpinLock`/`SpinUnlock`（拿不到→透传兜底） | — |
+| refcount 增减（attach/detach） | 原子自加/自减 | acq_rel |
+| 发布表项（插入最后一步写 state） | `Atomic32Set`（release） | release |
+| 查表读 state（attach 无锁） | `Atomic32ReadAcquire` | acquire |
+
+**崩溃**：TrySpinLock+兜底 → 降级不死锁；半截创建最多泄漏一个槽（不影响别人）。无全系统死锁。
 
 ---
 
@@ -90,13 +122,13 @@ typedef struct {
 } PoolCfg;
 
 /* ---- 元数据共享区 ---- */
-typedef struct {                      /* 一个池块 */
-    void*  base;                      /* 本进程内的(VA-same)基址 */
+typedef struct {                      /* 一个池块（单一共享池，所有进程共用） */
+    void*  base;                      /* (VA-same)基址，所有进程相同 */
     char   shmname[MM_NAME_MAX];      /* 池块自己的 OS 名字（如 "mmpool/f4/n0/c64k/3"） */
     INT32  flags;                     /* 该块所属 flags */
     int    numa;                      /* -1=非OnPg；否则节点号 */
     UINT32 slot_size, nslots, nfree;
-    int    free_head;                 /* 空闲槽链表头（空闲槽内存放下一个空闲槽的索引） */
+    int    free_head;                 /* 空闲槽链表头（改动需持 g.lock；空闲槽内存放下一空闲槽索引） */
 } PoolBlock;
 
 typedef struct {                      /* 注册项：一个被池化的业务区域（按 name 唯一） */
@@ -104,17 +136,17 @@ typedef struct {                      /* 注册项：一个被池化的业务区
     int    block_idx, slot_idx;
     UINT32 size;                      /* 业务原始申请大小 */
     INT32  flags;
-    int    refcount;
-    int    state;                     /* 0空 1用 2墓碑（开放寻址用） */
-} NameEntry;
+    INT32  refcount;                  /* 原子自加/自减（attach/detach，不持 g.lock） */
+    INT32  state;                     /* 插入时持锁写、最后一步 release 置 USED；查表 acquire 读 */
+} NameEntry;                          /*   0空 1用(USED) 2墓碑(TOMBSTONE) */
 
 typedef struct {
-    mm_spinlock_t lock;               /* 跨进程自旋锁 */
-    PoolCfg cfg;                      /* 配置快照 */
-    int     nblocks;
+    mm_spinlock_t lock;               /* 跨进程自旋锁：保护"创建路径"（切槽/建块/名字增删）；
+                                         用 TrySpinLock + 兜底透传，不依赖它崩溃健壮 */
+    PoolCfg   cfg;                    /* 配置快照（CP 启动时写入） */
+    INT32     nblocks;                /* 池块数（持锁修改） */
     PoolBlock blocks[MM_MAX_BLOCKS];
-    NameEntry names[MM_NAME_TABLE_CAP];   /* name→槽 的开放寻址哈希 */
-    /* per-(flags,numa,class) 的"当前可分配块"索引，v1 可先线性扫 blocks[] */
+    NameEntry names[MM_NAME_TABLE_CAP];   /* name→槽 开放寻址哈希：插入持锁+release发布，查表 acquire 无锁 */
 } PoolMeta;
 ```
 
@@ -140,22 +172,24 @@ INT32 Platform_ShmMap(flags, name, size, void** out):
   if !cfg.enable or size >= cfg.threshold or !poolable(flags, cfg):
       return OS ShmMap(flags, name, size, out)           // 透传
 
-  lock(meta)
-  e = name_lookup(name)
-  if e != NULL:                                          // 同名 attach
-      e.refcount += 1
+  e = name_lookup_acquire(name)                          // 无锁查表（acquire 读 state）
+  if e != NULL:                                          // 同名 attach —— 全程无锁
       *out = slot_addr(e)
-      rc = e.refcount
-  else:
-      cls = pick_class(size, cfg)                        // 最小满足 size 的大小类
-      if cls < 0: unlock; return OS ShmMap(...)          // 没有合适类 → 透传
-      slot = alloc_slot(flags, numa=-1, cls)             // 不够则增长池块
-      if slot == FAIL: unlock; return OS ShmMap(...)     // 池满兜底 → 透传
-      e = name_insert(name, slot, size, flags)           // 登记
-      e.refcount = 1
-      *out = slot_addr(e)
-      rc = 1
-  unlock(meta)
+      return Atomic_Inc(&e.refcount)                     // 原子自增，返回引用数
+
+  cls = pick_class(size, cfg)                            // 需要创建：选最小满足的大小类
+  if cls < 0: return OS ShmMap(...)                      // 无合适类 → 透传
+
+  if !TrySpinLock(&meta.lock, RETRY_LIMIT):              // 拿不到锁（持锁者卡住/崩溃）
+      return OS ShmMap(...)                              // → 兜底透传，永不死锁
+  e = name_lookup(name)                                  // 双检：拿锁期间别人可能已创建
+  if e == NULL:
+      slot = alloc_slot(flags, numa=-1, cls)             // 不够则增长池块（见 4.3）
+      if slot == FAIL: SpinUnlock(&meta.lock); return OS ShmMap(...)  // 池满 → 透传
+      e = name_insert_publish(name, slot, size, flags)   // 写好字段，最后一步 release 置 state=USED
+  rc = Atomic_Inc(&e.refcount)
+  *out = slot_addr(e)
+  SpinUnlock(&meta.lock)
   return rc                                              // 返回值=引用数（与 OS 一致）
 ```
 
@@ -178,17 +212,14 @@ alloc_slot(flags, numa, cls):
 ### 4.4 Platform_ShmUnmap
 ```
 INT32 Platform_ShmUnmap(void* addr):
-  blk = find_block_containing(addr)                      // 地址区间查（块表二分）
+  blk = find_block_containing(addr)                      // 地址区间查（无锁读块表，块表只在创建时增）
   if blk == NULL: return OS ShmUnmap(addr)               // 非池内存 → 透传
 
-  lock(meta)
   slot = (addr - blk.base) / blk.slot_size
   e = entry_of(blk, slot)                                // 反查注册项
-  e.refcount -= 1
-  if e.refcount <= 0:
-      free_slot(blk, slot)                               // 槽压回 free list, nfree++
-      name_remove(e)                                     // 注册项置墓碑
-  unlock(meta)
+  if Atomic_Dec(&e.refcount) == 0:                       // 原子自减，无锁
+      Atomic_Set_Release(&e.state, TOMBSTONE)            // 标记可回收，不立刻动 free list
+      // 槽的实际回收：由后续"创建路径"持锁时顺带扫墓碑归还，或收尾统一回收
   return 0
 ```
 
@@ -238,15 +269,21 @@ INT32 Platform_ShmUnmap(void* addr):
 
 ---
 
-## 9. 需要你拍板的点（审阅重点）
+## 9. 决策状态（审阅重点）
 
-1. **【A】谁会调 `ShmMap` 申请新区域？** CP/DP 都会 → 跨进程共享分配器（复杂）；只 CP 申请、DP 仅 attach → 可大幅简化为单写者。**这条最关键，决定整体复杂度与风险。**
-2. **【B】崩溃恢复要求多高？** v1 能否接受"持锁崩溃/refcount 泄漏"的弱一致（靠重启恢复）？
-3. **OS 对 shm "段数量"有无上限 / 每段固定开销？** 影响是否值得把部分大块也纳入池、阈值定多大。
-4. **flags 4 与 5 必须分池**（我认为是，隔离不能破）—— 确认。
-5. **大小类初值 + 池块大小**（16/64/128/256K…，块 2MB？）。
-6. **`MM_NAME_MAX` / 表与块的上限**（定长数组上界）。
-7. ~~VA-differs（~1%）v1 透传是否可接受？~~ → **已确认：透传，暂不考虑**（见 §0）。
+**已确认：**
+- **【A】CP/DP 都能申请** → **单一共享池** + `TrySpinLock`（拿不到→兜底透传）+ 原子 refcount（§2.5）。否决"每进程 arena"（牺牲打包密度）。
+- **【B】崩溃**：`TrySpinLock`+兜底 → 最坏**降级透传、绝不死锁**；**不依赖锁崩溃健壮**。
+- **NUMA**：部署固定、消费者大多同节点 → 池块放**公共节点**；OnPg 按节点分池；配置静态指定。
+- **范围**：VA-differs/process-shared/大块 → 透传，不池化（§0）。
+- **flags 4 与 5 分池**（共享范围不同，隔离不能破）。
+- **attach 无锁**（查表 acquire + 原子 refcount），创建才持锁 → 性能严格友好。
+
+**待定（不阻塞主体设计）：**
+1. **OS 对 shm "段数量"有无上限 / 每段固定开销？**（影响是否把部分大块也纳入池、阈值大小）
+2. **大小类初值 + 池块大小**（建议 16/32/64/128/256K/512K/1M，块 2MB；上线后据数据在配置里调）。
+3. **`MM_NAME_MAX` / 名字表·块表上限**（定长数组上界取值）。
+4. **DP 创建 vs attach 比例**（决定锁争用强度；可用"创建者归属"统计量化，不阻塞）。
 
 ---
 
