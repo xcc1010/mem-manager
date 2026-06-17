@@ -124,16 +124,21 @@ typedef struct {
 /* ---- 元数据共享区 ---- */
 typedef struct {                      /* 一个池块（单一共享池，所有进程共用） */
     void*  base;                      /* (VA-same)基址，所有进程相同 */
-    char   shmname[MM_NAME_MAX];      /* 池块自己的 OS 名字（如 "mmpool/f4/n0/c64k/3"） */
+    char   shmname[MM_NAME_MAX];      /* 池块自己的 OS 名字 */
     INT32  flags;                     /* 该块所属 flags */
     int    numa;                      /* -1=非OnPg；否则节点号 */
-    UINT32 slot_size, nslots, nfree;
-    int    free_head;                 /* 空闲槽链表头（改动需持 g.lock；空闲槽内存放下一空闲槽索引） */
+    UINT32 block_size;
+    union {                           /* 策略私有状态（见 §3.5） */
+        struct { UINT32 slot_size, nslots, nfree; int free_head; } slab;
+        struct { UINT32 next; }                                    bump;
+        struct { UINT32 free_head; }                               flist; /* 首个空闲chunk偏移 */
+    } u;
 } PoolBlock;
 
 typedef struct {                      /* 注册项：一个被池化的业务区域（按 name 唯一） */
     char   name[MM_NAME_MAX];
-    int    block_idx, slot_idx;
+    int    block_idx;
+    UINT32 off;                       /* 块内字节偏移（slab: 槽号=off/slot_size） */
     UINT32 size;                      /* 业务原始申请大小 */
     INT32  flags;
     INT32  refcount;                  /* 原子自加/自减（attach/detach，不持 g.lock） */
@@ -152,6 +157,42 @@ typedef struct {
 
 > 备注：v1 用**定长数组 + 上限**（`MM_MAX_BLOCKS` 等），简单、无动态内存、契合无 libc 的 DP。
 > 上限值通过配置/编译期常量给，超出则兜底透传。
+
+### 3.5 可插拔分配策略（slab / freelist / bump，三选，配置决定）
+
+把"框架"与"怎么从块里切一块"解耦：**名字表、引用计数、路由、锁、NUMA、地址反查全部与策略无关**，
+每个"逻辑池"选一种策略，**只有 `carve`/`release` 两个函数不同**。
+
+```c
+typedef enum { ALLOC_SLAB, ALLOC_FREELIST, ALLOC_BUMP } AllocKind;
+
+typedef struct {                 /* 一个逻辑池：服务某 (flags,node) 下某 size 范围 */
+    AllocKind kind;
+    UINT32 min_size, max_size;   /* 覆盖的请求大小区间 */
+    UINT32 block_size;
+    INT32  flags; int numa;      /* (flags,node) 维度由系统按需实例化，不必在配置里展开 */
+    /* 它的 PoolBlock 列表索引；每块的策略私有状态见 §3 的 union */
+} Pool;
+
+/* 持锁调用：从池切 size 字节 → (块,偏移)，不够则建新块；返回 FAIL=池满 */
+int  pool_carve  (Pool* p, UINT32 size, int* blk_out, UINT32* off_out);
+/* 释放（按策略不同行为） */
+void pool_release(Pool* p, int blk, UINT32 off, UINT32 size);
+```
+
+三种策略的 `carve`/`release`：
+
+| 策略 | carve | release | 复杂度/特性 |
+|---|---|---|---|
+| **slab** | 该大小类块里弹 `u.slab.free_head` | 槽压回 free_head | O(1)、零外碎片、有档间内碎片；**支持复用槽** |
+| **freelist** | 遍历空闲 chunk 找够大的(first/best fit)，按需 split | chunk 插回 + 合并相邻 | O(n)、精确无内碎片、**有外碎片**、临界区长 |
+| **bump** | 对齐 `u.bump.next` 后推进（可做成**原子 fetch-add → 无锁**） | **空操作**（整块收尾回收） | O(1)、精确、无外碎片、最省最快；**不单独复用槽** |
+
+共同点：`addr = block.base + off`；unmap 的"地址反查 (块,偏移) → 注册项"也与策略无关。
+⇒ **新增/切换策略，改动只局限在 `carve`/`release`。**
+
+选型建议：**会运行期复用槽 → slab**；**任意大小+频繁复用(像通用 malloc) → freelist**；
+**init-once/长生命周期不复用 → bump（最优）**。可全局选一种，也可按 size 范围分多个逻辑池各用各的。
 
 ---
 
@@ -177,37 +218,44 @@ INT32 Platform_ShmMap(flags, name, size, void** out):
       *out = slot_addr(e)
       return Atomic_Inc(&e.refcount)                     // 原子自增，返回引用数
 
-  cls = pick_class(size, cfg)                            // 需要创建：选最小满足的大小类
-  if cls < 0: return OS ShmMap(...)                      // 无合适类 → 透传
+  node = resolve_node(flags, name, caller)               // OnPg→pgname节点；非OnPg→调用方节点
+  pool = pick_pool(flags, node, size)                    // 选覆盖该 size 的逻辑池(及其策略)
+  if pool == NULL: return OS ShmMap(...)                 // 无合适池 → 透传
 
   if !TrySpinLock(&meta.lock, RETRY_LIMIT):              // 拿不到锁（持锁者卡住/崩溃）
       return OS ShmMap(...)                              // → 兜底透传，永不死锁
   e = name_lookup(name)                                  // 双检：拿锁期间别人可能已创建
   if e == NULL:
-      slot = alloc_slot(flags, numa=-1, cls)             // 不够则增长池块（见 4.3）
-      if slot == FAIL: SpinUnlock(&meta.lock); return OS ShmMap(...)  // 池满 → 透传
-      e = name_insert_publish(name, slot, size, flags)   // 写好字段，最后一步 release 置 state=USED
+      if !pool_carve(pool, size, &blk, &off):            // 按策略切（slab/freelist/bump，见 3.5/4.3）
+          SpinUnlock(&meta.lock); return OS ShmMap(...)  // 池满 → 透传
+      e = name_insert_publish(name, blk, off, size, flags)  // 写好字段，最后一步 release 置 state=USED
   rc = Atomic_Inc(&e.refcount)
-  *out = slot_addr(e)
+  *out = addr_of(e)                                      // = blocks[e.block_idx].base + e.off
   SpinUnlock(&meta.lock)
   return rc                                              // 返回值=引用数（与 OS 一致）
 ```
 
-### 4.3 alloc_slot（含池块增长）
+### 4.3 pool_carve（按策略派发，含池块增长）
 ```
-alloc_slot(flags, numa, cls):
-  blk = find_block_with_free(flags, numa, cls.slot_size)
+pool_carve(pool, size, &blk, &off):                      // 持 meta.lock
+  blk = find_block_in_pool_with_room(pool, size)         // slab:有空槽；bump:next+size≤块；flist:有够大chunk
   if blk == NULL:
-      if class_block_count(flags,numa,cls) >= cls.max_blocks (且非0): return FAIL
-      name_blk = make_pool_block_name(flags, numa, cls)
-      base = (numa<0) ? OS ShmMap(flags, name_blk, cfg.block_size, ...)
-                      : OS ShmMapOnPg(flags, pg_of(numa), name_blk, cfg.block_size, ...)
+      if pool_block_count(pool) >= pool.max_blocks (且非0): return FAIL
+      name_blk = make_pool_block_name(pool)
+      // 慢的 OS 申请尽量放锁外（reserve 模式）；这里简化为同步
+      base = (pool.numa<0) ? OS ShmMap   (pool.flags, name_blk, pool.block_size, ...)
+                           : OS ShmMapOnPg(pool.flags, pg_of(pool.numa), name_blk, pool.block_size, ...)
       if base == NULL: return FAIL
-      blk = register_block(base, name_blk, flags, numa, cls.slot_size)
-      build_free_list(blk)                               // 切 nslots 个槽串成 free list
-  slot = blk.free_head; blk.free_head = next_of(slot); blk.nfree--
-  return (blk, slot)
+      blk = register_block(pool, base, name_blk)          // 按 pool.kind 初始化 union（slab切槽/bump置next=0/flist整块为一空闲chunk）
+  // 按策略切：
+  switch pool.kind:
+    SLAB:     off = pop_free_slot(blk)                    // O(1)
+    BUMP:     off = align(blk.u.bump.next); blk.u.bump.next = off+size   // O(1)（可改原子fetch-add）
+    FREELIST: off = first_fit_split(blk, size)            // O(n)+split
+  return true
 ```
+
+`pool_release(pool, blk, off, size)`：SLAB→压回 free_head；BUMP→空操作；FREELIST→插回+合并相邻。
 
 ### 4.4 Platform_ShmUnmap
 ```
@@ -215,8 +263,8 @@ INT32 Platform_ShmUnmap(void* addr):
   blk = find_block_containing(addr)                      // 地址区间查（无锁读块表，块表只在创建时增）
   if blk == NULL: return OS ShmUnmap(addr)               // 非池内存 → 透传
 
-  slot = (addr - blk.base) / blk.slot_size
-  e = entry_of(blk, slot)                                // 反查注册项
+  off = addr - blk.base                                  // 块内偏移（与策略无关）
+  e = entry_of(blk, off)                                 // 反查注册项（块内 offset→entry 索引）
   if Atomic_Dec(&e.refcount) == 0:                       // 原子自减，无锁
       Atomic_Set_Release(&e.state, TOMBSTONE)            // 标记可回收，不立刻动 free list
       // 槽的实际回收：由后续"创建路径"持锁时顺带扫墓碑归还，或收尾统一回收
@@ -235,6 +283,42 @@ INT32 Platform_ShmUnmap(void* addr):
 - **解析放 CP 端**：手写极简 INI 解析（几十行，不引第三方库）；结果填 `PoolCfg` 存进元数据 shm。
 - **DP 不读文件**：attach 元数据 shm 即拿到 `cfg`。
 - 路径由 `MEM_POOL_CONFIG` 环境变量或平台既有配置入口给。
+
+### 5.1 逻辑池 + 策略选择（配置驱动）
+每个 `[pool.X]` 声明一个**逻辑池**：策略(slab/freelist/bump) + 覆盖的 size 范围 + 块大小。
+路由按 `size` 落到覆盖它的逻辑池；`(flags, node)` 维度由系统自动实例化（每池可生出 flags4/5 × node0/1 的实例），**不必在配置里展开**。
+
+```ini
+[pool]
+enable     = true
+threshold  = 0x200000          ; ≥此值透传（大块不进池）
+poolable_flags = 4,5           ; 只池化 VA-same
+
+# 小且可能复用 → slab（O(1)、可回收槽）
+[pool.small]
+strategy   = slab
+classes    = 0x4000,0x10000,0x40000     ; 16K/64K/256K 槽
+block_size = 0x200000                   ; 2MB
+
+# 长生命周期、不单独复用 → bump（精确、无外碎片、最快、可无锁）
+[pool.longlived]
+strategy   = bump
+range      = 0x40000:0x200000           ; 256K..<2MB
+block_size = 0x800000                   ; 8MB
+
+# 任意大小 + 频繁释放复用（少见）→ freelist
+# [pool.general]
+# strategy = freelist
+# range    = ...
+
+[numa]
+# 固定部署：把 pg/vcpu 映射到节点，供"非OnPg按调用方节点放置"用
+# pg1 = 1   ; numa1（主）
+# pg0 = 0   ; numa0（少量）
+```
+
+> 最简起步：只配**一个** `[pool.*]`，`strategy=bump`（若纯 init-once），`range=0:threshold` 覆盖全部小块。
+> 之后再按需拆出多档/多策略，全在配置里调，不改代码。
 
 ---
 
