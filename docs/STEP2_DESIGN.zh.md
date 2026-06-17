@@ -16,6 +16,11 @@
 
 保留 OS 两个语义：**名字共享**（同名 attach 拿同一块）+ **引用计数**（返回值=refcount）。
 
+### 已确认决策
+- **VA-differs（flags 0/1/2）与 process-shared（flags 3）：一律透传 OS，暂不池化、不考虑。**
+  池子只处理 VA-same（flags 4/5）。`poolable_flags_mask` 默认仅含 4、5。这把 v1 的范围限定在
+  ~99% 的 VA-same 上，且无需为偏移寻址（VA-differs 必须用 offset）设计任何东西。
+
 ---
 
 ## 1. 总体分层
@@ -241,7 +246,7 @@ INT32 Platform_ShmUnmap(void* addr):
 4. **flags 4 与 5 必须分池**（我认为是，隔离不能破）—— 确认。
 5. **大小类初值 + 池块大小**（16/64/128/256K…，块 2MB？）。
 6. **`MM_NAME_MAX` / 表与块的上限**（定长数组上界）。
-7. **VA-differs（~1%）** v1 透传是否可接受？
+7. ~~VA-differs（~1%）v1 透传是否可接受？~~ → **已确认：透传，暂不考虑**（见 §0）。
 
 ---
 
