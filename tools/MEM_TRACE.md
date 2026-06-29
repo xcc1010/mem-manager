@@ -51,9 +51,18 @@ python3 analyze_mem_trace.py /tmp/snap.dump --resolve
 # 2) 到底是「小块累积」还是「大块」——看 live malloc 的大小分布
 python3 analyze_mem_trace.py /tmp/snap.dump --hist
 
-# 3) 把 top 看到的真实 RSS（mmap 侧）按函数拆开
+# 3) 对账：实测驻留 vs top 的 RSS（确认 5G 解释了多少、要不要追直接 syscall 分配器）
 python3 analyze_mem_trace.py /tmp/snap.dump --smaps /tmp/smaps.txt --resolve
 ```
+
+`--smaps` 会先打印一段 **RECONCILIATION**：把 smaps 的 RSS 按 anon/heap/file/stack 分类，
+和我们 `mincore` 实测的驻留对账：
+
+- **覆盖率高**（实测驻留 ≈ anon+heap territory）→ 那 5G 已被按函数拆清楚，排名可信；
+- **未解释的 territory 很大** → 有走**直接 syscall 的分配器**（或低于采样间隔的小块、
+  分配器保留的已 free 页），这才需要考虑加 `syscall()` 拦截。
+
+> 注意对账用 **anon+heap territory**（分配器领地）而非 total RSS——后者含代码/库的文件映射，与业务无关。
 输出形如：
 ```
 ## malloc/new live by function (sampled estimate)

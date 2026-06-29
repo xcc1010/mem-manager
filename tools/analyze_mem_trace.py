@@ -79,6 +79,37 @@ def parse_smaps(path):
     return vmas
 
 
+def smaps_categories(path):
+    """Sum RSS by mapping category: anon / heap / file / stack / other."""
+    cats = collections.defaultdict(int)
+    cur = None
+
+    def is_hdr(tok):
+        if not tok or '-' not in tok[0] or ':' in tok[0]:
+            return False
+        s = tok[0].split('-')
+        return len(s) == 2 and all(c in '0123456789abcdefABCDEF' for c in s[0] + s[1])
+
+    with open(path) as f:
+        for line in f:
+            tok = line.split()
+            if is_hdr(tok):
+                p = tok[5] if len(tok) >= 6 else ''
+                if p == '':
+                    cur = 'anon'
+                elif p == '[heap]':
+                    cur = 'heap'
+                elif p.startswith('[stack'):
+                    cur = 'stack'
+                elif p.startswith('/'):
+                    cur = 'file'
+                else:
+                    cur = 'other'
+            elif line.startswith('Rss:') and cur is not None:
+                cats[cur] += int(line.split()[1]) * 1024
+    return cats
+
+
 def load_symmap(path):
     """Load a precomputed 'frame<TAB>function' map (from resolve_dump.sh)."""
     m = {}
@@ -251,6 +282,35 @@ def main():
                       100 * agg[label] / a_live if a_live else 0))
 
     if a.smaps:
+        cats = smaps_categories(a.smaps)
+        smaps_total = sum(cats.values())
+        territory = cats['anon'] + cats['heap']    # malloc/allocator land
+        our = a_res + m_res
+        print('\n## RECONCILIATION: measured resident vs smaps RSS')
+        print('  smaps total RSS          %9.1f MiB' % (smaps_total / MiB))
+        print('    anon (mmap)            %9.1f MiB' % (cats['anon'] / MiB))
+        print('    [heap] (brk)           %9.1f MiB' % (cats['heap'] / MiB))
+        print('    => allocator territory %9.1f MiB  (anon+heap, should be ours)'
+              % (territory / MiB))
+        print('    file-backed (code/lib) %9.1f MiB  (not ours)' % (cats['file'] / MiB))
+        print('    stack/other            %9.1f MiB' %
+              ((cats['stack'] + cats['other']) / MiB))
+        print('  our measured resident    %9.1f MiB  (malloc %.1f + mmap %.1f)'
+              % (our / MiB, a_res / MiB, m_res / MiB))
+        if not have_res:
+            print('  (!) dump has no resident data -- rebuild mem_trace.so for mincore RSS')
+        elif territory > 0:
+            cov = 100.0 * our / territory
+            gap = territory - our
+            print('  coverage of territory    %5.0f%%   unexplained %9.1f MiB'
+                  % (cov, gap / MiB))
+            if gap > 0.2 * territory:
+                print('  -> large unexplained allocator RSS: likely an allocator using')
+                print('     direct syscalls (consider syscall() interception), allocations')
+                print('     below the sampling interval, or allocator-retained freed pages.')
+            else:
+                print('  -> territory well explained; the per-function ranking covers the RSS.')
+
         g, unattr, total = attribute_rss(m_recs, parse_smaps(a.smaps))
         attributed = sum(g.values())
         print('\n## RSS breakdown by function (smaps RSS x mmap stacks)')
