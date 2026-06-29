@@ -98,6 +98,29 @@ python3 analyze_mem_trace.py snap.dump --symmap symmap.txt
 
 > 经验：生产部署库多被 strip，**路线一（编译机 + `--bin-dir`）通常最稳**。
 
+## 申请量 vs 驻留量(重要）
+
+malloc 拦截看到的是**申请字节**（程序向 malloc 要的），不是 `top` 的 RSS（真正摸过、驻留物理内存的）。
+程序常常申请远大于实际使用（大缓冲稀疏用 / overcommit），所以 `requested` 可能比 RSS 大很多。
+
+dump 时工具对每个存活分配调用 **`mincore()` 实测驻留页**，所以输出同时给出两列：
+```
+# malloc/new : requested 40996.0 MiB | RESIDENT 4980.0 MiB | N samples
+## malloc/new by function (ranked by RESIDENT)
+  RESIDENT  3120.5 MiB | requested 28000.0 MiB  x1234 samples
+    businessX  (libsim.so)
+    ...
+```
+- **大块（≥采样间隔，全采样）→ RESIDENT 精确**，所以 RSS 大头能准确归因；
+- 已被 free/unmap 的幻影记录 `mincore` 返回 0 → 自动排除。
+- 排名默认按 **RESIDENT**（有 mincore 数据时），这才对得上 `top` 的占用。
+
+## 所有分配挤在一个函数里？加大 `--depth`
+
+如果程序有统一分配入口（如 `calloc_rtos` / 自定义 `pool_alloc`），所有分配的栈顶都是它，
+浅分组会把一切并成一个巨桶。**加大 `--depth`（如 `--depth 15`）** 让它按包装函数“上面”
+的真实业务调用者区分，才能看出是哪块业务。
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |

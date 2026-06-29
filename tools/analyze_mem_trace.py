@@ -36,8 +36,20 @@ def parse_dump(path):
             p = line.split()
             if len(p) < 5 or p[0] not in ('A', 'M'):
                 continue
-            rec = dict(addr=int(p[1], 16), size=int(p[2]), weight=int(p[3]),
-                       flags=int(p[4], 16), stack=tuple(p[5:]))
+            # two layouts: with resident (newer) or without (older).
+            #   K addr size weight resident flags <frames...>
+            #   K addr size weight flags          <frames...>
+            if p[4].startswith('0x'):
+                resident, flags, fi = 0, int(p[4], 16), 5
+            else:
+                resident, flags, fi = int(p[4]), int(p[5], 16), 6
+            # estimated resident scaled like weight (exact for big allocs where
+            # weight == size; statistical for sampled small ones)
+            size = int(p[2]); weight = int(p[3])
+            est_res = resident * (weight / size) if size else 0
+            rec = dict(addr=int(p[1], 16), size=size, weight=weight,
+                       resident=resident, est_res=est_res, flags=flags,
+                       stack=tuple(p[fi:]))
             (a_recs if p[0] == 'A' else m_recs).append(rec)
     return a_recs, m_recs
 
@@ -213,8 +225,15 @@ def main():
 
     a_live = sum(r['weight'] for r in a_recs)
     m_live = sum(r['weight'] for r in m_recs)
-    print('# malloc/new live (sampled est): %.1f MiB across %d samples' % (a_live / MiB, len(a_recs)))
-    print('# mmap live (exact):            %.1f MiB across %d mappings' % (m_live / MiB, len(m_recs)))
+    a_res = sum(r['est_res'] for r in a_recs)
+    m_res = sum(r['est_res'] for r in m_recs)
+    have_res = any(r['resident'] for r in a_recs) or any(r['resident'] for r in m_recs)
+    print('# malloc/new : requested %.1f MiB | RESIDENT %.1f MiB | %d samples'
+          % (a_live / MiB, a_res / MiB, len(a_recs)))
+    print('# mmap       : requested %.1f MiB | RESIDENT %.1f MiB | %d mappings'
+          % (m_live / MiB, m_res / MiB, len(m_recs)))
+    if not have_res:
+        print('# (no resident data in dump -- rebuild mem_trace.so to get mincore RSS)')
 
     if a.hist:
         buckets = [(0, '<4K'), (4 << 10, '4-16K'), (16 << 10, '16-64K'),
@@ -242,16 +261,26 @@ def main():
             for fr in show(stack):
                 print('    ' + fr)
 
-    print('\n## malloc/new live by function (sampled estimate)')
-    for stack, (b, c) in rank_by_stack(a_recs, a.depth)[:a.top]:
-        print('\n%9.1f MiB  x%d samples' % (b / MiB, c))
+    # rank by RESIDENT when we have mincore data (that's the real footprint),
+    # else fall back to requested bytes.
+    key = 'est_res' if have_res else 'weight'
+    label = 'RESIDENT' if have_res else 'requested'
+    print('\n## malloc/new by function (ranked by %s)' % label)
+    req_by = dict((s, bc) for s, bc in rank_by_stack(a_recs, a.depth, 'weight'))
+    for stack, (b, c) in rank_by_stack(a_recs, a.depth, key)[:a.top]:
+        req = req_by.get(stack, [0, 0])[0]
+        print('\n  RESIDENT %8.1f MiB  | requested %8.1f MiB  x%d samples'
+              % (b / MiB, req / MiB, c) if have_res
+              else '\n  requested %8.1f MiB  x%d samples' % (b / MiB, c))
         for fr in show(stack):
             print('    ' + fr)
 
     if not a.smaps and m_recs:
-        print('\n## mmap live by function (exact; pass --smaps to convert to RSS)')
-        for stack, (b, c) in rank_by_stack(m_recs, a.depth)[:a.top]:
-            print('\n%9.1f MiB  x%d' % (b / MiB, c))
+        mlabel = 'RESIDENT' if have_res else 'requested'
+        mkey = 'est_res' if have_res else 'weight'
+        print('\n## mmap by function (ranked by %s)' % mlabel)
+        for stack, (b, c) in rank_by_stack(m_recs, a.depth, mkey)[:a.top]:
+            print('\n  %s %8.1f MiB  x%d' % (mlabel, b / MiB, c))
             for fr in show(stack):
                 print('    ' + fr)
 

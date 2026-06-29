@@ -261,6 +261,28 @@ static int append_frame(char *buf, int n, int cap, void *pc){
     return snprintf(buf + n, cap - n, " ?+0x%lx", (unsigned long)(uintptr_t)pc);
 }
 
+/* measured resident bytes of [addr, addr+size) via mincore (RSS, not virtual).
+ * page-aligns down; processes in windows so a partially-unmapped (freed) region
+ * just contributes 0 for the failing window instead of aborting. */
+static size_t resident_bytes(void *addr, size_t size){
+    if (!addr || !size) return 0;
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) pg = 4096;
+    uintptr_t a = (uintptr_t)addr;
+    uintptr_t cur = a & ~((uintptr_t)pg - 1);
+    size_t npages = ((size_t)(a - cur) + size + pg - 1) / (size_t)pg;
+    size_t resident = 0;
+    unsigned char vec[4096];                      /* up to 4096 pages / window */
+    while (npages){
+        size_t batch = npages < sizeof vec ? npages : sizeof vec;
+        if (mincore((void *)cur, batch * (size_t)pg, vec) == 0)
+            for (size_t i = 0; i < batch; i++) if (vec[i] & 1) resident++;
+        cur += batch * (size_t)pg;
+        npages -= batch;
+    }
+    return resident * (size_t)pg;
+}
+
 static void do_dump(const char *reason){
     pthread_mutex_lock(&dump_mtx);
     char path[1024];
@@ -272,7 +294,8 @@ static void do_dump(const char *reason){
 
     char hdr[256];
     int hn = snprintf(hdr, sizeof hdr,
-        "# mem_trace dump (%s) sample=%zu : <K> <addr> <size> <weight> <flags> <frame...>\n",
+        "# mem_trace dump (%s) sample=%zu : "
+        "<K> <addr> <size> <weight> <resident> <flags> <frame...>\n",
         reason, sample_bytes);
     if (write(fd, hdr, hn) < 0) {}
 
@@ -284,8 +307,9 @@ static void do_dump(const char *reason){
                 Entry *e = &sh->tab[i];
                 if (e->addr == NULL || e->addr == (void *)1) continue;
                 char line[8192];
-                int n = snprintf(line, sizeof line, "%c %p %zu %zu 0x%x",
-                                 e->kind, e->addr, e->size, e->weight, e->flags);
+                size_t res = resident_bytes(e->addr, e->size);
+                int n = snprintf(line, sizeof line, "%c %p %zu %zu %zu 0x%x",
+                                 e->kind, e->addr, e->size, e->weight, res, e->flags);
                 if (e->stackid >= 0 && e->stackid < stk_used){
                     Stk *st = &stks[e->stackid];
                     for (int f = 0; f < st->n && n < (int)sizeof(line) - 256; f++)
