@@ -69,6 +69,35 @@ python3 analyze_mem_trace.py /tmp/snap.dump --smaps /tmp/smaps.txt --resolve
 ```
 `UNATTRIBUTED` = 没对接上的 RSS（glibc 小对象 arena / brk / 库 / 栈），让你看出「6G 解释了多少」。
 
+## 符号解析：在哪台机器翻函数名
+
+dump 记的是「模块+偏移」，偏移是模块内相对值，在**任何一台有同一次构建的库**的机器上都能翻。两条路线：
+
+### 路线一（推荐）：在编译机翻（那里有 python + 符号 + addr2line）
+dump 里是运行机路径，编译机上对不上，所以告诉它去哪找库：
+```sh
+python3 analyze_mem_trace.py snap.dump --resolve \
+    --bin-dir /编译机/abseil/lib --bin-dir /编译机/sim/lib \
+    --addr2line aarch64-linux-gnu-addr2line       # 交叉工具链的 addr2line
+```
+- `--bin-dir DIR`（可多次）：按文件名到这些目录找库；
+- `--map OLD=NEW`（可多次）：路径前缀替换（如 `--map /opt/sim=/home/me/build`）；
+- `--addr2line`：指定交叉版 addr2line；
+- 找不到库会打印 `WARN: cannot locate ...`（不再静默）。
+- 前提：编译机的库与部署是**同一次构建**（自己编的通常是）→ 偏移一致 → 准确。
+
+### 路线二：在运行机翻（无需 python，但要求部署库未被 strip）
+`resolve_dump.sh`（纯 sh + awk + addr2line）用运行机本地库把帧翻成函数，产出映射表：
+```sh
+# 运行机
+sh resolve_dump.sh snap.dump aarch64-linux-gnu-addr2line > symmap.txt
+# 拷回编译机，喂给分析器（不再需要库/addr2line）
+python3 analyze_mem_trace.py snap.dump --symmap symmap.txt
+```
+若部署库被 strip，运行机翻出来全是 `??` → 回退到路线一。
+
+> 经验：生产部署库多被 strip，**路线一（编译机 + `--bin-dir`）通常最稳**。
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |

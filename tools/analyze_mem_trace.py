@@ -19,6 +19,8 @@ Usage:
 import argparse
 import bisect
 import collections
+import os
+import sys
 import subprocess
 
 MAP_ANONYMOUS = 0x20
@@ -65,24 +67,74 @@ def parse_smaps(path):
     return vmas
 
 
-def make_resolver(enabled, depth):
+def load_symmap(path):
+    """Load a precomputed 'frame<TAB>function' map (from resolve_dump.sh)."""
+    m = {}
+    if not path:
+        return m
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip('\n')
+            if '\t' in line:
+                fr, name = line.split('\t', 1)
+                if name and name != '??':
+                    m[fr] = name
+    return m
+
+
+def make_resolver(enabled, depth, symmap=None, bin_dirs=None, path_maps=None,
+                  a2l='addr2line'):
+    symmap = symmap or {}
+    bin_dirs = bin_dirs or []
+    path_maps = path_maps or []
     cache = {}
+    located = {}          # dump module path -> local file path (or None)
+    missing = set()
+
+    def locate(mod):
+        if mod in located:
+            return located[mod]
+        p = None
+        if os.path.isfile(mod):
+            p = mod
+        else:
+            for old, new in path_maps:
+                if mod.startswith(old):
+                    cand = new + mod[len(old):]
+                    if os.path.isfile(cand):
+                        p = cand
+                        break
+            if p is None:
+                base = os.path.basename(mod)
+                for d in bin_dirs:
+                    cand = os.path.join(d, base)
+                    if os.path.isfile(cand):
+                        p = cand
+                        break
+        if p is None and mod not in missing:
+            missing.add(mod)
+            sys.stderr.write('WARN: cannot locate %s (use --bin-dir/--map)\n' % mod)
+        located[mod] = p
+        return p
 
     def sym(fr):
-        if not enabled:
-            return fr
         if fr in cache:
             return cache[fr]
         out = fr
-        try:
+        if fr in symmap:                       # precomputed (e.g. run-machine)
+            out = symmap[fr]
+        elif enabled and '+' in fr:
             mod, off = fr.rsplit('+', 1)
-            r = subprocess.run(['addr2line', '-f', '-C', '-e', mod, off],
-                               capture_output=True, text=True, timeout=10)
-            name = r.stdout.split('\n')[0].strip()
-            if name and name != '??':
-                out = '%s  (%s)' % (name, mod.split('/')[-1])
-        except Exception:
-            pass
+            local = locate(mod)
+            if local:
+                try:
+                    r = subprocess.run([a2l, '-f', '-C', '-e', local, off],
+                                       capture_output=True, text=True, timeout=10)
+                    name = r.stdout.split('\n')[0].strip()
+                    if name and name != '??':
+                        out = '%s  (%s)' % (name, os.path.basename(mod))
+                except Exception as ex:
+                    sys.stderr.write('WARN: addr2line failed (%s): %s\n' % (a2l, ex))
         cache[fr] = out
         return out
 
@@ -136,13 +188,28 @@ def main():
     ap.add_argument('dump')
     ap.add_argument('--smaps', help='/proc/<pid>/smaps snapshot -> real RSS for mmap side')
     ap.add_argument('--resolve', action='store_true', help='addr2line module+off -> function')
+    ap.add_argument('--symmap', help='precomputed frame<TAB>function map (from resolve_dump.sh)')
+    ap.add_argument('--bin-dir', action='append', default=[], dest='bin_dir',
+                    help='dir to search for libraries by basename (repeatable)')
+    ap.add_argument('--map', action='append', default=[], dest='path_map',
+                    metavar='OLD=NEW', help='remap module path prefix (repeatable)')
+    ap.add_argument('--addr2line', default='addr2line',
+                    help='addr2line binary (e.g. aarch64-linux-gnu-addr2line)')
     ap.add_argument('--depth', type=int, default=6, help='stack frames to group/show')
     ap.add_argument('--top', type=int, default=25)
     ap.add_argument('--hist', action='store_true', help='size histogram of live malloc')
     a = ap.parse_args()
 
+    path_maps = []
+    for m in a.path_map:
+        if '=' in m:
+            old, new = m.split('=', 1)
+            path_maps.append((old, new))
+
     a_recs, m_recs = parse_dump(a.dump)
-    show = make_resolver(a.resolve, a.depth)
+    symmap = load_symmap(a.symmap)
+    show = make_resolver(a.resolve or bool(symmap), a.depth, symmap,
+                         a.bin_dir, path_maps, a.addr2line)
 
     a_live = sum(r['weight'] for r in a_recs)
     m_live = sum(r['weight'] for r in m_recs)
