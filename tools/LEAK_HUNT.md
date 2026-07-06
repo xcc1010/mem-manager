@@ -116,9 +116,37 @@ python3 analyze_mem_trace.py /tmp/mt.dump --resolve --depth 15
 
 ---
 
-## 符号解析(翻不出函数名时)
+## 符号解析:把「模块+偏移」翻成函数名
 
-生产库多被 strip,运行机上 `--resolve` 可能全是 `模块+偏移`。到**编译机**用同一次构建的库翻:
+dump 里的帧是 `模块+偏移`。翻成函数名**不需要 `-g`**:
+
+> `-g` 加的是 **DWARF 调试信息**(`file:line` + 内联帧);**函数名来自 ELF 符号表**。
+> 只要库/程序**没被 strip**(符号表在),就能翻——只是没行号、内联函数看不到,定位泄漏点足够。
+> 先确认:`file ./your_program` 显示 `not stripped`,或 `nm -C ./your_program | head` 有输出。
+
+### 路线一(推荐):运行机上翻,产出 symmap 拷回来
+
+运行机上库就在 dump 记的路径上,直接翻,产出 `frame<TAB>function` 表:
+
+```sh
+# ① addr2line 版(addr2line -f 无 -g 时回退符号表拿函数名,多数工具链够用)
+sh resolve_dump.sh    /tmp/mt.dump.2 [aarch64-linux-gnu-addr2line] > /tmp/symmap.txt
+
+# ② 纯 nm 版(万一 addr2line 不回退、吐 ??,用它兜底:只查 .symtab/.dynsym,
+#    不碰 addr2line/DWARF,busybox awk 也能跑)
+sh resolve_dump_nm.sh /tmp/mt.dump.2 [aarch64-linux-gnu-nm aarch64-linux-gnu-readelf] > /tmp/symmap.txt
+```
+
+拷回来喂分析器(不再需要库/工具):
+
+```sh
+python3 analyze_mem_trace.py /tmp/mt.dump.2 --baseline /tmp/mt.dump.1 \
+    --hours 1.5 --symmap /tmp/symmap.txt --depth 15
+```
+
+### 路线二:编译机上翻(库被 strip,或想要行号)
+
+用同一次构建的**未 strip / 带 `-g`** 的库翻:
 
 ```sh
 python3 analyze_mem_trace.py mt.dump.2 --baseline mt.dump.1 --resolve --depth 15 \
@@ -126,11 +154,13 @@ python3 analyze_mem_trace.py mt.dump.2 --baseline mt.dump.1 --resolve --depth 15
     --addr2line aarch64-linux-gnu-addr2line
 ```
 
-- `--bin-dir DIR`(可多次):按文件名到这些目录找库;
-- `--map OLD=NEW`:路径前缀替换;
+- `--bin-dir DIR`(可多次):按文件名到这些目录找库;`--map OLD=NEW`:路径前缀替换;
 - 找不到库会打印 `WARN: cannot locate ...`。
 
-详见 `MEM_TRACE.md` 的「符号解析」两条路线。
+> **无 `-g` 的坑**:被内联进调用者的函数不会单独成帧,你看到的是它的**外层函数名**。若定位太粗,
+> 对那个 `.so` 单独带 `-g` 重编一版放编译机,走路线二精确翻(含行号)。
+
+详见 `MEM_TRACE.md` 的「符号解析」。
 
 ---
 
