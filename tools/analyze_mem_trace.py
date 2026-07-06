@@ -195,6 +195,40 @@ def rank_by_stack(recs, depth, weight_key='weight'):
     return sorted(g.items(), key=lambda kv: kv[1][0], reverse=True)
 
 
+def growth_by_stack(base_recs, cur_recs, depth, key):
+    """Per-stack (current - baseline) of `key`, sorted by biggest growth.
+
+    Yields (stack, delta, base, cur, cur_count). A leak grows monotonically,
+    so its stack floats to the top by delta while bounded stacks sit near 0."""
+    gb = dict(rank_by_stack(base_recs, depth, key))
+    gc = dict(rank_by_stack(cur_recs, depth, key))
+    rows = []
+    for k in set(gb) | set(gc):
+        b = gb.get(k, [0, 0])[0]
+        c, n = gc.get(k, [0, 0])
+        rows.append((k, c - b, b, c, n))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return rows
+
+
+def print_growth(title, rows, show, top, hours):
+    print('\n## %s' % title)
+    shown = 0
+    for stack, delta, b, c, n in rows:
+        if delta < 0.05 * MiB:          # drop noise / shrinking stacks
+            break
+        rate = '  = %+.1f MiB/h' % (delta / MiB / hours) if hours else ''
+        print('\n  %+9.1f MiB%s   | %.1f -> %.1f MiB  x%d samples'
+              % (delta / MiB, rate, b / MiB, c / MiB, n))
+        for fr in show(stack):
+            print('    ' + fr)
+        shown += 1
+        if shown >= top:
+            break
+    if shown == 0:
+        print('  (no stack grew by >= 0.05 MiB)')
+
+
 def attribute_rss(m_recs, vmas):
     recs = sorted(m_recs, key=lambda r: r['addr'])
     starts = [r['addr'] for r in recs]
@@ -241,6 +275,10 @@ def main():
     ap.add_argument('--depth', type=int, default=6, help='stack frames to group/show')
     ap.add_argument('--top', type=int, default=25)
     ap.add_argument('--hist', action='store_true', help='size histogram of live malloc')
+    ap.add_argument('--baseline', help='earlier dump; report per-function GROWTH '
+                    '(current - baseline) instead of totals -> pinpoints the leak')
+    ap.add_argument('--hours', type=float, default=0.0,
+                    help='hours between --baseline and dump; extrapolates MiB/h')
     a = ap.parse_args()
 
     path_maps = []
@@ -265,6 +303,28 @@ def main():
           % (m_live / MiB, m_res / MiB, len(m_recs)))
     if not have_res:
         print('# (no resident data in dump -- rebuild mem_trace.so to get mincore RSS)')
+
+    if a.baseline:
+        b_a, b_m = parse_dump(a.baseline)
+        b_have = any(r['resident'] for r in b_a) or any(r['resident'] for r in b_m)
+        use_res = have_res and b_have
+        gkey = 'est_res' if use_res else 'weight'
+        glabel = 'RESIDENT' if use_res else 'requested'
+        cur_tot = sum(r[gkey] for r in a_recs + m_recs)
+        base_tot = sum(r[gkey] for r in b_a + b_m)
+        d = cur_tot - base_tot
+        hrs = a.hours or 0.0
+        rate = '  = %+.1f MiB/h' % (d / MiB / hrs) if hrs else ''
+        print('\n# GROWTH by %s  (dump - baseline)%s'
+              % (glabel, '' if use_res else '  [no mincore data -> requested bytes]'))
+        print('# total live grew %+.1f MiB%s   (baseline %.1f -> %.1f MiB)'
+              % (d / MiB, rate, base_tot / MiB, cur_tot / MiB))
+        print_growth('malloc/new growth by function (ranked by %s delta)' % glabel,
+                     growth_by_stack(b_a, a_recs, a.depth, gkey), show, a.top, hrs)
+        if b_m or m_recs:
+            print_growth('mmap growth by function (ranked by %s delta)' % glabel,
+                         growth_by_stack(b_m, m_recs, a.depth, gkey), show, a.top, hrs)
+        return
 
     if a.hist:
         buckets = [(0, '<4K'), (4 << 10, '4-16K'), (16 << 10, '16-64K'),
