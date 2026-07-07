@@ -283,6 +283,10 @@ def main():
                     '(current - baseline) instead of totals -> pinpoints the leak')
     ap.add_argument('--hours', type=float, default=0.0,
                     help='hours between --baseline and dump; extrapolates MiB/h')
+    ap.add_argument('--by', choices=('resident', 'requested'), default='resident',
+                    help='growth metric for --baseline: resident (mincore RSS, '
+                    'default) or requested (allocated/virtual bytes -- use when '
+                    'VmSize grows but pages are not yet faulted in at snapshot)')
     a = ap.parse_args()
 
     path_maps = []
@@ -311,7 +315,7 @@ def main():
     if a.baseline:
         b_a, b_m = parse_dump(a.baseline)
         b_have = any(r['resident'] for r in b_a) or any(r['resident'] for r in b_m)
-        use_res = have_res and b_have
+        use_res = have_res and b_have and a.by == 'resident'
         gkey = 'est_res' if use_res else 'weight'
         glabel = 'RESIDENT' if use_res else 'requested'
         cur_tot = sum(r[gkey] for r in a_recs + m_recs)
