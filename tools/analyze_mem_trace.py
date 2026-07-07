@@ -44,9 +44,13 @@ def parse_dump(path):
             else:
                 resident, flags, fi = int(p[4]), int(p[5], 16), 6
             # estimated resident scaled like weight (exact for big allocs where
-            # weight == size; statistical for sampled small ones)
+            # weight == size; statistical for sampled small ones). Clamp resident
+            # to the alloc's own bytes first: mincore is page-granular, so a
+            # sub-page / page-sharing alloc reports a full page (> size); left
+            # unclamped the weight/size scale-up explodes est_res for many-small
+            # allocations (RESIDENT would exceed requested, which is impossible).
             size = int(p[2]); weight = int(p[3])
-            est_res = resident * (weight / size) if size else 0
+            est_res = min(resident, size) * (weight / size) if size else 0
             rec = dict(addr=int(p[1], 16), size=size, weight=weight,
                        resident=resident, est_res=est_res, flags=flags,
                        stack=tuple(p[fi:]))
