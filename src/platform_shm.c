@@ -6,7 +6,21 @@
 #  include "profiler/shm_profiler.h"
 #endif
 
+#ifdef MEM_MANAGER_POOL
+#  include "pool/mm_pool.h"
+#endif
+
 INT32 Platform_ShmMap(INT32 flags, char* shmname, UINT32 size, void** shm) {
+#ifdef MEM_MANAGER_POOL
+    INT32 pooled;
+    if (mm_pool_try_map(flags, shmname, size, shm, &pooled)) {
+#  ifdef MEM_MANAGER_PROFILE
+        shm_profiler_on_map("map", shmname, (shm ? *shm : NULL),
+                            size, flags, pooled, NULL);
+#  endif
+        return pooled;
+    }
+#endif
     INT32 ret = ShmMap(flags, shmname, size, shm);
 #ifdef MEM_MANAGER_PROFILE
     shm_profiler_on_map("map", shmname, (ret >= 0 && shm) ? *shm : NULL,
@@ -29,6 +43,15 @@ INT32 Platform_ShmMapOnPg(INT32 flags, char* pgname, char* shmname, UINT32 size,
 #endif
 
 INT32 Platform_ShmUnmap(void* shm) {
+#ifdef MEM_MANAGER_POOL
+    INT32 pooled;
+    if (mm_pool_try_unmap(shm, &pooled)) {
+#  ifdef MEM_MANAGER_PROFILE
+        shm_profiler_on_unmap(shm, pooled);
+#  endif
+        return pooled;
+    }
+#endif
     INT32 ret = ShmUnmap(shm);
 #ifdef MEM_MANAGER_PROFILE
     shm_profiler_on_unmap(shm, ret);

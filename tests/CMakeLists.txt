@@ -3,3 +3,10 @@ add_executable(mem_manager_tests test_mem_manager.c)
 target_link_libraries(mem_manager_tests PRIVATE mem_manager_lib)
 
 add_test(NAME mem_manager_tests COMMAND mem_manager_tests)
+
+# Pool test builds only when the pool is compiled into the library.
+if(MEM_MANAGER_POOL)
+    add_executable(mem_manager_pool_tests test_pool.c)
+    target_link_libraries(mem_manager_pool_tests PRIVATE mem_manager_lib)
+    add_test(NAME mem_manager_pool_tests COMMAND mem_manager_pool_tests)
+endif()

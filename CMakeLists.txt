@@ -18,12 +18,20 @@ endif()
 # instead of mem-manager's standalone shims + heap stub.
 option(MEM_MANAGER_USE_API_H "Pull types and OS Shm* from the real api.h" OFF)
 option(MEM_MANAGER_BUILD_TESTS "Build unit tests" ON)
+# Step-2 pool allocator. OFF -> Platform_ShmMap is pure Step-1 passthrough.
+# ON  -> small poolable requests are carved from shared OS blocks (bump strategy,
+#        strategy-pluggable). Runtime rollback via MEM_POOL_ENABLE=0.
+option(MEM_MANAGER_POOL "Enable the Step-2 shared-memory pool allocator" OFF)
 
 find_package(Threads REQUIRED)
 
 set(MEM_MANAGER_SOURCES
     src/platform_shm.c
     src/profiler/shm_profiler.c)
+
+if(MEM_MANAGER_POOL)
+    list(APPEND MEM_MANAGER_SOURCES src/pool/mm_pool.c)
+endif()
 
 if(NOT MEM_MANAGER_USE_API_H)
     list(APPEND MEM_MANAGER_SOURCES src/os/os_shm_stub.c)
@@ -40,6 +48,9 @@ target_link_libraries(mem_manager_lib PUBLIC Threads::Threads)
 target_compile_definitions(mem_manager_lib PUBLIC $<$<CONFIG:Debug>:MEM_MANAGER_PROFILE>)
 if(MEM_MANAGER_USE_API_H)
     target_compile_definitions(mem_manager_lib PUBLIC MEM_MANAGER_USE_API_H)
+endif()
+if(MEM_MANAGER_POOL)
+    target_compile_definitions(mem_manager_lib PUBLIC MEM_MANAGER_POOL)
 endif()
 
 if(MSVC)
