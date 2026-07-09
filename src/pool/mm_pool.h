@@ -3,18 +3,22 @@
 
 #include "platform/platform_types.h"
 
-/* Step-2 pool allocator (v0).
+/* Step-2 pool allocator (v1).
  *
  * Routes small, poolable Platform_ShmMap requests into large OS blocks so many
  * sub-2MB allocations share one 2MB-granular OS region (the whole point: kill
- * the per-region rounding waste). v0 implements the BUMP strategy only, but the
- * framework is strategy-pluggable: name registry, refcount, routing, address
- * reverse-lookup and config are all strategy-agnostic; only carve()/release()
- * differ per strategy, selected by config. SLAB/FREELIST are reserved.
+ * the per-region rounding waste). BUMP strategy only, but the framework is
+ * strategy-pluggable: routing, the name registry, refcount and address
+ * reverse-lookup are all strategy-agnostic; only carve()/release() differ per
+ * strategy, selected by config. SLAB/FREELIST are reserved.
  *
- * v0 scope: process-local metadata (covers CP intra-process name sharing),
- * pthread mutex, no OnPg/NUMA. See docs/STEP2_DESIGN.zh.md. Compiled only when
- * MEM_MANAGER_POOL is defined; otherwise Platform_ShmMap is pure Step-1 passthrough. */
+ * v1: metadata (config, block table, name registry, lock) lives in a shared OS
+ * region so every process/plane resolves the same name -> slot; the attach hot
+ * path is LOCK-FREE (atomic-published entries + atomic refcount), only creation
+ * takes a cross-process spinlock (TrySpinLock + passthrough fallback). All sync
+ * is C11 <stdatomic.h> (no pthread) so it also compiles for the C-only DP plane.
+ * See docs/STEP2_DESIGN.zh.md §2.2/§2.5. Compiled only when MEM_MANAGER_POOL is
+ * defined; otherwise Platform_ShmMap is pure Step-1 passthrough. */
 
 #ifdef __cplusplus
 extern "C" {
