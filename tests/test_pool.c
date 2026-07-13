@@ -78,6 +78,25 @@ static void test_concurrency(void) {
     printf("concurrency: ok (%d threads x %d iters)\n", NT, ITERS);
 }
 
+/* Simulate a second process attaching the existing shared meta (OS refcount > 1,
+ * ready-flag barrier) and resolving a name the first "process" created. If the
+ * re-init had instead created a fresh meta, the name would be gone. */
+static void test_cross_process_attach(void) {
+    void* a = NULL;
+    INT32 r = Platform_ShmMap(4, "cross/x", 200, &a);   /* process 1 creates the slot */
+    assert(r == 1 && a);
+
+    mm_pool_reset_for_test();                            /* drop our attachment */
+
+    mm_pool_init(NULL);                                  /* process 2: re-attach (ret>1) */
+
+    void* a2 = NULL;
+    r = Platform_ShmMap(4, "cross/x", 200, &a2);         /* must find the shared entry */
+    assert(a2 == a);                                     /* same slot -> shared registry */
+    assert(r == 2);                                      /* attach -> refcount incremented */
+    printf("cross-process attach: ok (shared registry survived re-attach, addr=%p)\n", a2);
+}
+
 int main(void) {
     Mm_PoolCfg cfg;
     mm_pool_default_cfg(&cfg);
@@ -90,6 +109,7 @@ int main(void) {
 
     test_functional();
     test_concurrency();
+    test_cross_process_attach();
 
     printf("pool v1 (bump, shared-meta, lock-free attach) tests passed\n");
     return 0;

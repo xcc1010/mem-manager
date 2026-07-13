@@ -136,6 +136,14 @@ static void ensure_init(void) {
         mm_pool_init(NULL);
 }
 
+/* TEST ONLY: forget our attachment so the next init re-runs meta_attach. The
+ * shared region itself is left mapped (not OS-unmapped), so re-attaching sees
+ * OS refcount > 1 and takes the attacher (ready-barrier) branch. */
+void mm_pool_reset_for_test(void) {
+    g_meta = NULL;
+    atomic_store_explicit(&g_init_state, 0, memory_order_release);
+}
+
 /* ---------------- cross-process create-path spinlock ---------------- */
 
 static int try_lock(PoolMeta* m) {

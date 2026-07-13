@@ -60,6 +60,12 @@ int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret
  * the caller must call OS ShmUnmap. */
 int mm_pool_try_unmap(void* addr, INT32* ret);
 
+/* TEST ONLY: drop this process's attachment to the shared meta (does NOT unmap
+ * it). The next mm_pool_init re-runs the attach path, so a single-process test
+ * can exercise the "second process attaches an existing meta" case (OS refcount
+ * > 1 -> the ready-flag barrier). Not for production use. */
+void mm_pool_reset_for_test(void);
+
 #ifdef __cplusplus
 }
 #endif
