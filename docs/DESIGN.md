@@ -1,6 +1,8 @@
 # mem-manager — Design & Architecture (review doc)
 
-Status: **Step 1 implemented & verified.** Step 2 not started.
+Status: **Step 1 implemented & verified. Step 2 v1 (bump pool) implemented** and
+in internal-project trial; slab/freelist strategies and OnPg/NUMA pooling are
+out of scope for v1.
 Last updated for the C rewrite (DP-plane is C-only).
 
 ## 1. Problem
@@ -18,8 +20,8 @@ sub-allocate from them, with pool size / policy configurable.
    OS calls; under a Debug build only, each call is recorded so we can measure
    real usage (size / frequency / lifetime / waste) before committing to an
    allocator.
-2. **Step 2 — pool allocator (next).** Driven by Step-1 data; configurable pool
-   size; see §6.
+2. **Step 2 — pool allocator (v1 done, bump-only).** Driven by Step-1 data;
+   configurable via a JSON config file; see §6.
 
 ## 3. System architecture (the platform)
 
@@ -75,12 +77,15 @@ process sees the **same virtual address (VA)** for the region:
 processes (4/5), you may store raw pointers in shared memory. Where VA
 **differs** (0/1/2), stored pointers are meaningless in another process — the
 allocator must hand out **offsets**, and metadata inside the region must be
-offset-based. Therefore **VA-same and VA-differs memory must never share a
-pool.**
+offset-based. Therefore **different flags values must never share a pool
+block** (both across VA classes and across sharing scopes).
 
-Measured reality: **~99% of allocations are VA-same** (user code review). So
-Step 2 can be a single VA-same pool covering ~99%, and let the rare VA-differs
-pass straight through to `ShmMap` unpooled in v1.
+Measured reality (corrected 2026-07, supersedes the earlier "~99% VA-same"
+estimate): **the business workload is ~all VA-differs**. Step 2 therefore
+pools VA-differs directly: the shared metadata stores only offsets/indices,
+and each process attaches every pool block by name and resolves addresses
+against its own local VA. Default poolable flags = **{1}** (CP+DP inter-PG
+shared); the same code path also serves VA-same flags if enabled in the mask.
 
 ## 5. Step 1 — what is built
 
@@ -130,23 +135,63 @@ It accepts both schemas: pure JSONL (CP file backend) and OS-log lines (DP
 never-freed are reconstructed by correlating map↔unmap by address per context,
 so the DP backend can stay a dumb raw-event emitter.
 
-## 6. Step 2 — direction (not yet built)
+## 6. Step 2 — what is built (v1, bump-only)
 
-Informed by Step-1 data:
-- One **VA-same pool** with raw-pointer metadata, covering ~99%.
-- **Per-NUMA** pools keyed by `pgname` for the DP/`OnPg` path.
-- Pool size from configuration, lower-bounded by observed `peak_live_bytes`.
-- A `shmname → (pool, offset)` registry inside `Platform_ShmMap` to preserve
-  name-based sharing without a real per-name OS object.
-- Rare VA-differs (~1%): pass through to `ShmMap` in v1 (negligible waste); an
-  offset-based pool later if needed.
-- Must stay **C** (DP constraint).
+Implemented in `src/pool/mm_pool.{h,c}` (compiled with `-DMEM_MANAGER_POOL=ON`;
+default OFF keeps `Platform_ShmMap` a pure Step-1 passthrough):
+
+- **Scope:** poolable flags default to **{1}** (VA-differs, CP+DP inter-PG
+  shared — the dominant business usage); requests `>= threshold`, flags 3, and
+  any flags outside the mask pass straight through to `ShmMap`.
+- **VA-differs addressing:** the shared metadata (`mmpool/meta`, flags 1)
+  stores only offsets/indices — never pointers. Each process attaches every
+  pool block's OS region by name and resolves `address = local_base[block_idx]
+  + off` against its own VA (same code path also works for VA-same flags).
+- **BUMP strategy only** (2026-07 scope decision: the workload is dominated by
+  init-once/long-lived allocations, so bump's O(1) exact carve with no
+  per-slot reclaim is enough; slab/freelist were dropped from v1).
+- **Single shared pool, shared metadata.** Config, the block table, the name
+  registry and the lock live in a fixed-name shared region `mmpool/meta`
+  (flags 1, CP+DP inter-PG; it stores only offsets/indices, never pointers);
+  the creator publishes a ready flag, other processes/planes attach and get
+  the same name → slot resolution.
+- **Lock-free attach hot path:** acquire-load of the published entry + atomic
+  refcount++. Only creation takes a cross-process spinlock, via `TrySpinLock`
+  + bounded retries. All sync is C11 `<stdatomic.h>` (no pthread), so the DP
+  plane compiles it.
+- **No split sharing:** a poolable name never falls back to the OS while a
+  concurrent create of it may be in flight — the create path spins bounded
+  rounds of {try lock, re-check registry} and attaches to the published entry.
+  Passthrough happens only when the entry is still missing after the full
+  budget (lock frozen by a dead holder, pool/table full), in which case every
+  process fails identically and the name is consistently OS-shared.
+- **Conflicting re-maps fail loudly:** attach requires identical `flags` and a
+  request size that fits the registered slot; a mismatch returns an OS-style
+  error (`ret < 0`, `*shm = NULL`) instead of silently truncating or splitting.
+- **Name-based sharing preserved:** an open-addressing `shmname → (block,
+  offset)` registry with the OS-style refcount returned from `Platform_ShmMap`.
+- **Per-flags isolation:** different flags values never share a pool block
+  (different sharing scopes; blocks are segregated per flags).
+- **Config:** a flat JSON file (path from `MEM_POOL_CONFIG`; see
+  `config/pool.json`) read by the meta creator; attachers use the snapshot in
+  shared meta. `MEM_POOL_*` env vars still override the file — on the creator.
+  Note the rollback precondition: `enable=0` only takes effect when the meta
+  region is (re)created, i.e. after all processes have detached from it.
+
+Deferred (not in v1): per-slot reclaim (needs slab/freelist), OnPg/per-NUMA
+pools (`Platform_ShmMapOnPg` still passes through), pooled-unmap refcounting
+(profilers report pooled regions as never-freed), passthrough-name markers.
+Accepted trade-off: the OS `ShmMap` for a new pool block runs inside the
+create lock (taking it out would need a CREATING-state machine to avoid
+duplicate name registration); a holder crashing there freezes the pool, which
+degrades safely to consistent passthrough for new names.
 
 ## 7. Key constraints (the "重点")
 
 1. **DP is C-only** → entire implementation is C11.
 2. **Profiling is Debug-only** → zero footprint in release.
-3. **VA-same vs VA-differs must not share a pool** (hard correctness rule).
+3. **Different flags values must not share a pool block** (hard correctness
+   rule: sharing scope / VA class differ).
 4. **Pass-through must never change behaviour** in Step 1 (profile after the OS
    call, using its real return code / address).
 5. **Per-process logs** (CP and DP are different processes).

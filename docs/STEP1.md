@@ -40,9 +40,13 @@ virtual address (VA)** for the region:
 | 5 | CP + DP inter-PG shared; DP intra-PG shared | per-proc VA **same** |
 
 **Step-2 constraint:** VA-same regions (4/5) may store raw pointers in shared
-memory; VA-differs regions (0/1/2) must use offsets. The two must **not** share a
-pool. In practice ~99% of allocations are VA-same, so v1 can be a single VA-same
-pool and pass the rare VA-differs straight through to `ShmMap`.
+memory; VA-differs regions (0/1/2) must use offsets. Different flags values
+must **not** share a pool block.
+
+> **2026-07 correction:** the "~99% VA-same" estimate above was wrong — the
+> real workload is ~all VA-differs (0/1/2). Step 2 v1 therefore pools
+> VA-differs directly (offset-only shared metadata + per-process block
+> attach; default poolable flags = {1}). See DESIGN.md §4/§6.
 
 ## Output
 

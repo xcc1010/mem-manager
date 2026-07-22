@@ -3,23 +3,36 @@
 > 配套总览见 `设计文档.md`（两步走机制）。本文是 Step 2 的**详细实现设计**，
 > 供逐条分析与审阅。标注 **【待拍板】** 的是需要你确认的设计决策。
 
+> **2026-07 范围更新（已定）**：v1 只实现 **bump** 策略（业务以 init-once/长生命周期
+> 分配为主，slab/freelist 移出 v1 范围）；配置文件格式定为 **JSON**（扁平对象，
+> 手写极简解析器，见 `config/pool.json` 与 `mm_pool_load_config`）。
+>
+> **2026-07 数据修正（推翻早期"~99% VA-same"结论）**：实际业务**几乎全是 VA-differs**
+> （flags 0/1/2）。v1 因此**直接池化 VA-differs**：共享元数据只存偏移/索引、不存指针，
+> 各进程按块名自行 attach 池块、用本地 VA + 偏移寻址（同一路径天然兼容 VA-same）。
+> 默认可池化 flags = **{1}**（CP+DP 进程组间共享）。当前代码（`src/pool/mm_pool.c`）
+> 即按此实现并已进入内部项目试用。
+
 ---
 
 ## 0. 范围（v1）
 
 | 请求 | 处理 |
 |---|---|
-| `size < threshold` 且 `flags` 可池化（默认 VA-same = 4/5） | **进池**（slab 大小类） |
+| `size < threshold` 且 `flags` 可池化（**默认 {1}** = VA-differs，CP+DP 进程组间共享） | **进池**（bump 切槽） |
 | `size ≥ threshold`（大块） | **透传 OS** |
-| VA-differs（flags 0/1/2）、process-shared（3） | **透传 OS**（v1，占比 ~1%） |
+| 掩码外的 flags（含 process-shared 3、未启用的 0/2/4/5） | **透传 OS** |
 | `enable=false` | **全透传**（等价 Step 1，一键回滚） |
 
 保留 OS 两个语义：**名字共享**（同名 attach 拿同一块）+ **引用计数**（返回值=refcount）。
 
-### 已确认决策
-- **VA-differs（flags 0/1/2）与 process-shared（flags 3）：一律透传 OS，暂不池化、不考虑。**
-  池子只处理 VA-same（flags 4/5）。`poolable_flags_mask` 默认仅含 4、5。这把 v1 的范围限定在
-  ~99% 的 VA-same 上，且无需为偏移寻址（VA-differs 必须用 offset）设计任何东西。
+### 已确认决策（2026-07 修正后）
+- **直接池化 VA-differs**：早期"~99% VA-same、VA-differs 仅占 ~1% 故透传"的数据有误，
+  实际业务几乎全是 VA-differs（0/1/2），它们才是浪费大头。池化方案：共享元数据
+  **只存偏移/索引**（VA-differs 下裸指针跨进程无意义），各进程按池块名自行
+  `ShmMap` attach、缓存本地 VA，地址 = 本地基址 + 偏移。同一路径兼容 VA-same。
+- **process-shared（flags 3）：透传 OS**，不池化（语义不同，不进掩码）。
+- **不同 flags 值绝不共用池块**（共享范围隔离），池块按 flags 严格分开。
 
 ---
 
@@ -30,13 +43,14 @@
                                    │
                  ┌─────────────────┴───────────────┐
               透传 OS                            进池分配器
-            (大块/VA-differs)                       │
+        (大块/掩码外 flags)                         │
                                     ┌──────────────┼───────────────┐
-                              名字注册表        大小类 slab        池块来源
-                            name→(块,槽)    每类:池块[]+freelist   OS ShmMap
-                                                                 (大块,VA-same,按flags/NUMA)
-        元数据(注册表/freelist/池块表/锁/配置) ── 放在"元数据共享内存" ── CP建、各进程attach
-        配置文件 ── CP 启动读取 ── 解析后写入元数据
+                              名字注册表        bump 切槽          池块来源
+                            name→(块,偏移)   (v1, 无大小类)     OS ShmMap
+                                                          (大块,按 flags 分块)
+        元数据(注册表/池块表/锁/配置) ── 放在"元数据共享内存"(只存偏移) ── CP建、各进程attach
+        配置文件(JSON) ── CP 启动读取 ── 解析后写入元数据
+        各进程本地: block_idx → 本进程 VA (按块名 attach 一次, 之后纯查表)
 ```
 
 ---
@@ -46,12 +60,12 @@
 ### 2.1 池按什么 key 分？
 **pool key = (flags 值, [NUMA/pgname — 仅 OnPg], size_class)**
 
-- **按 flags 分**：flags 4（inter-PG 共享）与 5（intra-PG 共享）**共享范围不同**，绝不能放进同一个池块——否则一个 intra-PG 的数据落进 inter-PG 的块，隔离被破坏。所以**每个可池化的 flags 值各自一套池块**。
-- **按 NUMA/pgname 分**：`ShmMapOnPg` 要求内存落在指定 NUMA 节点，所以 OnPg 的池块要按节点分别申请。
-- **按 size_class 分**：slab 要求同一池块内槽大小固定。
+- **按 flags 分**：不同 flags 值**共享范围不同**（如 inter-PG 与 intra-PG），绝不能放进同一个池块——否则一个 intra-PG 的数据落进 inter-PG 的块，隔离被破坏。所以**每个可池化的 flags 值各自一套池块**。
+- **按 NUMA/pgname 分**：`ShmMapOnPg` 要求内存落在指定 NUMA 节点，所以 OnPg 的池块要按节点分别申请（v1 未实现，OnPg 透传）。
+- **按 size_class 分**：slab 要求同一池块内槽大小固定（v1 为 bump，无大小类）。
 
 ### 2.2 元数据放共享内存、跨进程访问
-- 注册表 / 池块表 都在一块**元数据 shm**（固定名字、VA-same）里。
+- 注册表 / 池块表 都在一块**元数据 shm**（固定名字 `mmpool/meta`，flags=1，**只存偏移/索引、不存指针**）里。
 - CP 和各 DP 进程都 attach 到**同一份** → 这样"同名 attach 拿同一槽"才成立。
 - **【已定 A】CP 和 DP 都能申请新区域**（DP 的小块占浪费大头，必须也能池化）。
 - 并发模型见 §2.5：**单一共享池**（打包最密、最省内存）+ **`TrySpinLock`（拿不到就兜底透传，永不死锁）** + **原子引用计数**。
@@ -64,8 +78,16 @@
 3. 槽 → 所属注册项（name, refcount）。
 4. 若不落在任何池块 → 是透传出去的 → 调 OS `ShmUnmap`。
 
-### 2.4 只池化 VA-same 才能发裸指针
-池块用 **VA-same flags** 申请 → 所有进程看到同一 VA → 块内槽地址跨进程稳定 → 可直接发裸指针、可在共享内存里存指针。这正是"只池化 VA-same"的根因。VA-differs 要用偏移，v1 不池化、直接透传。
+### 2.4 VA-differs 寻址：元数据只存偏移（2026-07 修正）
+早期方案是"只池化 VA-same、发裸指针"，根因是 VA-differs 内存里裸指针跨进程无意义。
+数据修正后（业务几乎全是 VA-differs），v1 改为**直接池化 VA-differs**：
+
+- 共享元数据（注册表/块表/锁/配置）**只存偏移与索引**（`block_idx, off, size, flags`），
+  不存任何指针 → VA 是否相同对元数据不再重要；
+- 每个进程对用到的池块**按块名自行 `ShmMap` attach**，拿到本进程的 VA 并缓存
+  （进程本地表 `block_idx → base`）；
+- 对外地址 = 本地基址 + 偏移；同一条路径对 VA-same 的块也正确（同名 attach 各进程同 VA）。
+- 代价：每进程每块一次性 attach（稳态后纯查表，attach 热路径仍无锁）。
 
 ### 2.5 并发与多进程模型（已定，核心）
 **模型：单一共享池**（打包最密、最省内存）。CP/DP 都能申请。用 DP 现成的**自旋锁 + 原子**协调。
@@ -75,7 +97,16 @@
 - 拿不到（持锁者卡住/崩溃）→ **兜底透传 OS `ShmMap`**。**永不死锁**，最坏退化为"这次不池化"，系统照跑。
 - ⇒ **锁是否崩溃健壮不影响安全性**（不依赖它）。
 
+> **v1 修正（防同名双映射）**：拿不到锁时**不能立刻透传**——若同名的并发创建正在进行，
+> 透传会让该名字同时存在于池和 OS（共享被撕裂）。v1 实现为**有界自旋 + 反复重查注册表**，
+> 预算（~100ms）远覆盖一次锁内 OS ShmMap；只有锁被死亡持有者冻结 / 池满时才透传，
+> 此时所有进程同样失败，同名经 OS 一致共享，路由不错乱。
+
 **(2) 临界区极小**：新池块的 OS `ShmMap`（慢、可能阻塞）在**锁外**做好，锁内只做几行赋值/链表操作（纳秒级）→ 崩溃窗口极小。且创建属 init-once，稳态几乎不触发。
+
+> **v1 实际取舍**：OS `ShmMap` **保留在锁内**。挪到锁外会让"慢速创建"失去串行化，
+> 同名可能被注册两次，需引入 CREATING 状态机才能闭合——v1 不值得。代价：持锁者若在
+> ShmMap 中崩溃，锁冻结（见 (1) 修正后的行为：新名字一致透传，系统仍正确）。
 
 **(3) attach 路径无锁（性能关键）**：业务频繁 map 一块**已存在**的共享区域（attach），不应争全局锁：
 - 名字表项**插入**在锁内完成，**最后一步**用 release 原子写置 `state=USED`；
@@ -116,14 +147,15 @@ typedef struct {
     int    enable;
     UINT32 threshold;                 /* ≥ 此值透传 OS（默认 0x200000=2MB） */
     UINT32 block_size;                /* 池块大小（OS 申请粒度，默认 2MB） */
-    UINT32 poolable_flags_mask;       /* 位掩码：哪些 flags 入池（默认 (1<<4)|(1<<5)） */
+    UINT32 poolable_flags_mask;       /* 位掩码：哪些 flags 入池（默认 1<<1） */
     int    nclasses;
     SizeClassCfg classes[MAX_CLASSES];
 } PoolCfg;
 
 /* ---- 元数据共享区 ---- */
 typedef struct {                      /* 一个池块（单一共享池，所有进程共用） */
-    void*  base;                      /* (VA-same)基址，所有进程相同 */
+    /* 2026-07 修正：不存 base 指针（VA-differs 下各进程 VA 不同）；
+     * 各进程用 shmname 自行 attach，本地缓存 block_idx → 本进程 VA */
     char   shmname[MM_NAME_MAX];      /* 池块自己的 OS 名字 */
     INT32  flags;                     /* 该块所属 flags */
     int    numa;                      /* -1=非OnPg；否则节点号 */
@@ -159,6 +191,9 @@ typedef struct {
 > 上限值通过配置/编译期常量给，超出则兜底透传。
 
 ### 3.5 可插拔分配策略（slab / freelist / bump，三选，配置决定）
+
+> **2026-07 更新：v1 只实现 bump**，本节保留作为后续演进的设计参考（配置中已无
+> `strategy` 项）。
 
 把"框架"与"怎么从块里切一块"解耦：**名字表、引用计数、路由、锁、NUMA、地址反查全部与策略无关**，
 每个"逻辑池"选一种策略，**只有 `carve`/`release` 两个函数不同**。
@@ -201,7 +236,7 @@ void pool_release(Pool* p, int blk, UINT32 off, UINT32 size);
 ### 4.1 初始化（CP / 平台 init）
 ```
 读配置文件 → PoolCfg
-meta = OS ShmMap("mmpool/meta", sizeof(PoolMeta), VA-same)   // 固定名元数据区
+meta = OS ShmMap("mmpool/meta", sizeof(PoolMeta), flags=1)   // 固定名元数据区，只存偏移
 若首次创建: 置零; spin_init(meta.lock); meta.cfg = PoolCfg
 (可选) 按各类 init_blocks 预留池块
 DP 启动: attach "mmpool/meta"（同名）→ 拿到同一份 meta，不读文件
@@ -276,63 +311,50 @@ INT32 Platform_ShmUnmap(void* addr):
 
 ---
 
-## 5. 配置文件
+## 5. 配置文件（JSON，v1 已实现）
 
-格式与字段详见 `设计文档.md §5`（INI 风格、十六进制字节、可增删大小类、增长策略、`enable` 一键回滚）。补充：
+- **格式：扁平 JSON 对象**（2026-07 定）。手写极简解析器（`mm_pool_load_config`，
+  无第三方库），只认扁平键值 + 一个整数数组，未知键忽略。
+- **解析放 CP 端 / 元数据创建方**：读文件后把结果填 `Mm_PoolCfg` 存进元数据 shm。
+- **DP 不读文件**：attach 元数据 shm 即拿到同一份 `cfg` 快照。
+- 路径由 `MEM_POOL_CONFIG` 环境变量给；优先级：**内置缺省 < JSON 文件 < `MEM_POOL_*` 环境变量**
+  （`MEM_POOL_ENABLE=0` 依旧是一键回滚）。
 
-- **解析放 CP 端**：手写极简 INI 解析（几十行，不引第三方库）；结果填 `PoolCfg` 存进元数据 shm。
-- **DP 不读文件**：attach 元数据 shm 即拿到 `cfg`。
-- 路径由 `MEM_POOL_CONFIG` 环境变量或平台既有配置入口给。
+v1 配置项（见 `config/pool.json`）：
 
-### 5.1 逻辑池 + 策略选择（配置驱动）
-每个 `[pool.X]` 声明一个**逻辑池**：策略(slab/freelist/bump) + 覆盖的 size 范围 + 块大小。
-路由按 `size` 落到覆盖它的逻辑池；`(flags, node)` 维度由系统自动实例化（每池可生出 flags4/5 × node0/1 的实例），**不必在配置里展开**。
-
-```ini
-[pool]
-enable     = true
-threshold  = 0x200000          ; ≥此值透传（大块不进池）
-poolable_flags = 4,5           ; 只池化 VA-same
-
-# 小且可能复用 → slab（O(1)、可回收槽）
-[pool.small]
-strategy   = slab
-classes    = 0x4000,0x10000,0x40000     ; 16K/64K/256K 槽
-block_size = 0x200000                   ; 2MB
-
-# 长生命周期、不单独复用 → bump（精确、无外碎片、最快、可无锁）
-[pool.longlived]
-strategy   = bump
-range      = 0x40000:0x200000           ; 256K..<2MB
-block_size = 0x800000                   ; 8MB
-
-# 任意大小 + 频繁释放复用（少见）→ freelist
-# [pool.general]
-# strategy = freelist
-# range    = ...
-
-[numa]
-# 固定部署：把 pg/vcpu 映射到节点，供"非OnPg按调用方节点放置"用
-# pg1 = 1   ; numa1（主）
-# pg0 = 0   ; numa0（少量）
+```json
+{
+  "enable": true,                  // false = 全透传（等价 Step 1，一键回滚）
+  "threshold": "0x200000",         // ≥ 此值透传 OS（大块不进池）；数字或 "0x.." 字符串
+  "block_size": "0x200000",        // 池块大小（OS 申请粒度）
+  "poolable_flags": [1]            // 只池化 flags=1（VA-differs，CP+DP 进程组间）
+}
 ```
 
-> 最简起步：只配**一个** `[pool.*]`，`strategy=bump`（若纯 init-once），`range=0:threshold` 覆盖全部小块。
-> 之后再按需拆出多档/多策略，全在配置里调，不改代码。
+> 最简起步即上例：`range = 0:threshold` 的全部小块都进 bump 池。
+> 后续若需要大小类/多策略，在 JSON 里扩展键即可，不改加载机制。
+
+### 5.1 演进预留：多逻辑池 + 策略选择（v1 未启用）
+
+原设计每个逻辑池声明策略（slab/freelist/bump）+ 覆盖的 size 范围 + 块大小，路由按
+`size` 落到覆盖它的逻辑池；`(flags, node)` 维度由系统自动实例化。v1 收敛为单一 bump
+池后，这些键（如 `pools` 数组、`classes`）**留待后续按真实数据再引入**。
 
 ---
 
-## 6. 边界与异常
+## 6. 边界与异常（v1 实现行为）
 
 | 情况 | 处理 |
 |---|---|
-| 池满（达 `max_blocks`） | **兜底透传 OS**（退化但不失败） |
-| `size` > 最大大小类但 < `threshold` | 透传 OS（或配置新增更大类） |
-| 名字哈希表满 | 透传 OS（或扩容，v1 先透传 + 告警） |
-| `name` 超长 | 截断或拒绝（**【待拍板】** `MM_NAME_MAX` 取值） |
-| 持锁进程崩溃 | **v1 风险点**：死锁/不一致（**【待拍板 B】** 健壮锁/恢复要求） |
-| refcount 泄漏（进程崩溃未 unmap） | v1 不回收（同上） |
-| `enable=false` | 全透传，等价 Step 1 |
+| 池满（达 `MM_MAX_BLOCKS`） / 块放不下 | **兜底透传 OS**（所有进程一致失败，同名仍经 OS 共享，路由不错乱） |
+| 名字哈希表满 | 透传 OS（同上，一致性成立） |
+| 创建路径拿不到锁 | **有界自旋 + 反复重查注册表**（~100ms 预算 ≫ 一次 OS ShmMap）；等不到且表项仍未出现才透传 → **同名不会同时进池和进 OS** |
+| 持锁进程崩溃 | 锁冻结：已池化名字照常 attach（无锁），新名字一致透传 OS → 池冻结但**系统行为正确**，无死锁 |
+| attach 与注册项不一致（flags 不同 / size 超登记值） | **明确报错**（返回 <0，`*shm=NULL`），不静默截断/分裂 |
+| `name` 超长（≥ `MM_NAME_MAX`=64） / 非 NUL 结尾 | 透传 OS（有界扫描，不越界读） |
+| 元数据创建者中途崩溃 | attacher **有界等待** ready（超时按无 meta 处理 → 透传），不永久卡死 |
+| refcount 泄漏（进程崩溃未 unmap） | v1 不回收（bump 无槽位回收；profiler 会把池化区域报为 never-freed，分析时注意口径） |
+| `enable=false` | 全透传，等价 Step 1。**前提：由 meta 创建者生效**——配置快照在共享 meta 里，须所有进程退出、meta 区域销毁后重建才换配置 |
 
 ---
 
@@ -359,9 +381,12 @@ block_size = 0x800000                   ; 8MB
 - **【A】CP/DP 都能申请** → **单一共享池** + `TrySpinLock`（拿不到→兜底透传）+ 原子 refcount（§2.5）。否决"每进程 arena"（牺牲打包密度）。
 - **【B】崩溃**：`TrySpinLock`+兜底 → 最坏**降级透传、绝不死锁**；**不依赖锁崩溃健壮**。
 - **NUMA**：部署固定、消费者大多同节点 → 池块放**公共节点**；OnPg 按节点分池；配置静态指定。
-- **范围**：VA-differs/process-shared/大块 → 透传，不池化（§0）。
-- **flags 4 与 5 分池**（共享范围不同，隔离不能破）。
+- **范围（2026-07 修正）**：VA-differs（0/1/2）**进池**（默认仅 {1}）；process-shared（3）/大块/掩码外 flags → 透传（§0）。
+- **不同 flags 值分池**（共享范围不同，隔离不能破）。
+- **元数据只存偏移**，各进程本地解析 VA（§2.4）。
 - **attach 无锁**（查表 acquire + 原子 refcount），创建才持锁 → 性能严格友好。
+- **【2026-07】v1 只做 bump**：slab/freelist 移出范围；`Mm_PoolCfg` 无 `strategy` 项。
+- **【2026-07】配置文件格式定为 JSON**（扁平对象；`MEM_POOL_CONFIG` 给路径，缺省 < 文件 < 环境变量）。
 
 **待定（不阻塞主体设计）：**
 1. **OS 对 shm "段数量"有无上限 / 每段固定开销？**（影响是否把部分大块也纳入池、阈值大小）
@@ -371,11 +396,11 @@ block_size = 0x800000                   ; 8MB
 
 ---
 
-## 10. 实施顺序（建议）
+## 10. 实施顺序（v1 现状）
 
-1. 先实现 **enable=false 透传 + 配置解析 + 元数据 shm 框架**（零行为变化，先打通基础设施）。
-2. 实现 **slab 分配/释放 + 名字注册表 + 引用计数**（单进程/单线程先跑通正确性）。
-3. 接 **地址反查 + unmap 回收**。
-4. 加 **跨进程锁 + 池块增长 + 兜底透传**。
-5. 接 **OnPg/NUMA**。
-6. 复用 Step 1 工具**验证内存占用下降**，据数据在配置里调大小类。
+1. ~~先实现 **enable=false 透传 + 配置解析 + 元数据 shm 框架**~~（已完成，JSON 配置）。
+2. **bump 分配 + 名字注册表 + 引用计数**（已完成；v1 收敛为 bump-only，跳过 slab）。
+3. **地址反查 + unmap 认领**（已完成；bump 不回收槽，回收留待后续策略）。
+4. **跨进程锁 + 池块增长 + 兜底透传**（已完成；attach 热路径无锁）。
+5. 接 **OnPg/NUMA**（未做，`Platform_ShmMapOnPg` 仍透传）。
+6. 内部项目试用中：复用 Step 1 工具**验证内存占用下降**，据数据在 JSON 配置里调参。

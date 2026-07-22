@@ -15,19 +15,19 @@ static void test_functional(void) {
     void *a = NULL, *b = NULL, *c = NULL, *big = NULL, *np = NULL;
     INT32 r;
 
-    /* two small poolable allocs (flags=4) pack adjacently in one block */
-    r = Platform_ShmMap(4, "obj/a", 4000, &a); assert(r == 1 && a);
-    r = Platform_ShmMap(4, "obj/b", 4000, &b); assert(r == 1 && b);
+    /* two small poolable allocs (flags=1) pack adjacently in one block */
+    r = Platform_ShmMap(1, "obj/a", 4000, &a); assert(r == 1 && a);
+    r = Platform_ShmMap(1, "obj/b", 4000, &b); assert(r == 1 && b);
     assert((char*)b - (char*)a == 4000);          /* 16-aligned, packed */
 
     /* same name -> same slot; refcount is attach-monotonic under bump */
-    r = Platform_ShmMap(4, "obj/a", 4000, &c); assert(c == a && r == 2);
+    r = Platform_ShmMap(1, "obj/a", 4000, &c); assert(c == a && r == 2);
 
     /* size >= threshold -> passthrough OS (separate region) */
-    r = Platform_ShmMap(4, "obj/big", 0x200000, &big); assert(r >= 0 && big);
+    r = Platform_ShmMap(1, "obj/big", 0x200000, &big); assert(r >= 0 && big);
     assert((char*)big < (char*)a || (char*)big >= (char*)a + 0x200000);
 
-    /* non-poolable flags (0) -> passthrough OS */
+    /* flags not in the mask (0) -> passthrough OS */
     r = Platform_ShmMap(0, "obj/np", 4000, &np); assert(r >= 0 && np);
 
     /* unmap: pooled detected (not OS-freed); bump does not reclaim */
@@ -38,7 +38,7 @@ static void test_functional(void) {
 
     /* re-attach: same slot; bump keeps it, refcount keeps climbing (3rd attach) */
     void* a2 = NULL;
-    r = Platform_ShmMap(4, "obj/a", 4000, &a2); assert(a2 == a && r == 3);
+    r = Platform_ShmMap(1, "obj/a", 4000, &a2); assert(a2 == a && r == 3);
 
     printf("functional: ok\n");
 }
@@ -54,7 +54,7 @@ static void* worker(void* arg) {
     for (int it = 0; it < ITERS; it++) {
         int k = it & 3;
         void* p = NULL; INT32 r;
-        r = Platform_ShmMap(4, (char*)SHARED[k], 128, &p);
+        r = Platform_ShmMap(1, (char*)SHARED[k], 128, &p);
         assert(r >= 1 && p);
         /* every thread must resolve a shared name to the SAME slot */
         void* seen = NULL;
@@ -66,7 +66,7 @@ static void* worker(void* arg) {
         char nm[32];
         snprintf(nm, sizeof nm, "u/%ld/%d", (long)id, it);
         void* q = NULL;
-        r = Platform_ShmMap(4, nm, 64, &q); assert(r >= 1 && q);
+        r = Platform_ShmMap(1, nm, 64, &q); assert(r >= 1 && q);
     }
     return NULL;
 }
@@ -83,18 +83,64 @@ static void test_concurrency(void) {
  * re-init had instead created a fresh meta, the name would be gone. */
 static void test_cross_process_attach(void) {
     void* a = NULL;
-    INT32 r = Platform_ShmMap(4, "cross/x", 200, &a);   /* process 1 creates the slot */
+    INT32 r = Platform_ShmMap(1, "cross/x", 200, &a);   /* process 1 creates the slot */
     assert(r == 1 && a);
 
-    mm_pool_reset_for_test();                            /* drop our attachment */
+    mm_pool_reset_for_test();                            /* drop our attachment + VA cache */
 
     mm_pool_init(NULL);                                  /* process 2: re-attach (ret>1) */
 
     void* a2 = NULL;
-    r = Platform_ShmMap(4, "cross/x", 200, &a2);         /* must find the shared entry */
+    r = Platform_ShmMap(1, "cross/x", 200, &a2);         /* must find the shared entry */
     assert(a2 == a);                                     /* same slot -> shared registry */
     assert(r == 2);                                      /* attach -> refcount incremented */
     printf("cross-process attach: ok (shared registry survived re-attach, addr=%p)\n", a2);
+}
+
+/* ---- JSON config file parsing ---- */
+static void test_json_config(void) {
+    const char* path = "test_pool_cfg.json";
+    FILE* f = fopen(path, "w");
+    assert(f);
+    fputs("{\n"
+          "  \"enable\": false,\n"
+          "  \"threshold\": \"0x10000\",\n"
+          "  \"block_size\": 4194304,\n"
+          "  \"poolable_flags\": [1, 2]\n"
+          "}\n", f);
+    fclose(f);
+
+    Mm_PoolCfg c;
+    mm_pool_default_cfg(&c);                 /* sane baseline (env/file-free here) */
+    assert(mm_pool_load_config(path, &c) == 0);
+    assert(c.enable == 0);
+    assert(c.threshold == 0x10000u);         /* hex string form */
+    assert(c.block_size == 4194304u);        /* decimal number form */
+    assert(c.poolable_flags_mask == ((1u << 1) | (1u << 2)));
+    remove(path);
+
+    assert(mm_pool_load_config("no/such/file.json", &c) == -1);
+    printf("json config: ok\n");
+}
+
+/* ---- consistency: conflicting re-map of a pooled name must fail loudly ---- */
+static void test_conflict(void) {
+    void* p = (void*)1;
+    INT32 r;
+
+    /* "obj/a" was created by test_functional: flags=1, size=4000 */
+    r = Platform_ShmMap(1, "obj/a", 8000, &p);   /* same name, larger size */
+    assert(r < 0 && p == NULL);                  /* rejected, not silently truncated */
+
+    p = (void*)1;
+    r = Platform_ShmMap(2, "obj/a", 4000, &p);   /* same name, different flags */
+    assert(r < 0 && p == NULL);                  /* rejected, scope must not mix */
+
+    p = NULL;
+    r = Platform_ShmMap(1, "obj/a", 2000, &p);   /* smaller attach: fits, allowed */
+    assert(p != NULL && r >= 2);
+
+    printf("conflict: ok\n");
 }
 
 int main(void) {
@@ -103,13 +149,14 @@ int main(void) {
     cfg.enable = 1;
     cfg.threshold = 0x200000;
     cfg.block_size = 0x200000;
-    cfg.poolable_flags_mask = (1u << 4) | (1u << 5);
-    cfg.strategy = MM_ALLOC_BUMP;
+    cfg.poolable_flags_mask = (1u << 1) | (1u << 2);
     mm_pool_init(&cfg);           /* explicit init before threads (see note below) */
 
     test_functional();
     test_concurrency();
     test_cross_process_attach();
+    test_json_config();
+    test_conflict();
 
     printf("pool v1 (bump, shared-meta, lock-free attach) tests passed\n");
     return 0;

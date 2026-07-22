@@ -1,0 +1,6 @@
+{
+  "enable": true,
+  "threshold": "0x200000",
+  "block_size": "0x200000",
+  "poolable_flags": [1]
+}

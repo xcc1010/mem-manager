@@ -8,10 +8,11 @@ will eventually pre-allocate large regions and sub-allocate from a pool.
 Written in **C (C11)** so the data-plane (DP) C-only toolchain can compile it; a
 C++ control plane calls the same functions via the `extern "C"` headers.
 
-- **Step 1 (current):** `Platform_Shm*` pass through to the OS calls, plus a
+- **Step 1 (done):** `Platform_Shm*` pass through to the OS calls, plus a
   Debug-only profiler that records request size / frequency / lifetime / sharing
   semantics. See [docs/STEP1.md](docs/STEP1.md).
-- **Step 2 (planned):** a configurable pool allocator informed by Step-1 data.
+- **Step 2 (v1 done, in trial):** a bump pool allocator driven by a JSON config
+  file. See [docs/STEP2_DESIGN.zh.md](docs/STEP2_DESIGN.zh.md).
 
 Full design, architecture and constraints: **[docs/DESIGN.md](docs/DESIGN.md)**.
 
@@ -35,6 +36,32 @@ API instead of the bundled heap stub:
 ```sh
 cmake -S . -B build -DMEM_MANAGER_USE_API_H=ON
 ```
+
+To enable the Step-2 pool allocator (bump, v1):
+
+```sh
+cmake -S . -B build -DMEM_MANAGER_POOL=ON
+```
+
+## Pool configuration
+
+With the pool enabled, small poolable requests (VA-same flags 4/5, size below
+`threshold`) are carved from shared 2MB-class OS blocks; everything else passes
+through to the OS unchanged. Configuration (see [config/pool.json](config/pool.json)):
+
+```json
+{ "enable": true, "threshold": "0x200000", "block_size": "0x200000",
+  "poolable_flags": [4, 5] }
+```
+
+- The meta creator reads the JSON file named by `MEM_POOL_CONFIG` (flat object;
+  unknown keys ignored; sizes accept decimal numbers or `"0x.."` strings) and
+  publishes the resulting config in shared metadata — attaching processes never
+  read the file.
+- Precedence: built-in defaults < JSON file < `MEM_POOL_*` env vars
+  (`MEM_POOL_ENABLE`, `MEM_POOL_THRESHOLD`, `MEM_POOL_BLOCK_SIZE`,
+  `MEM_POOL_FLAGS`). `MEM_POOL_ENABLE=0` is the one-key rollback to pure
+  pass-through.
 
 ## Run
 
@@ -64,7 +91,9 @@ python tools/analyze_profile.py "shm_profile.*.jsonl"
 include/platform/      public API: platform_shm.h, platform_types.h
 src/                    Platform_Shm* wrappers (platform_shm.c)
 src/os/                 OS Shm* declarations + heap stub for standalone builds
+src/pool/               Step-2 bump pool allocator (mm_pool.*), -DMEM_MANAGER_POOL=ON
 src/profiler/           thread-safe JSONL profiler, Debug-only (shm_profiler.c)
+config/pool.json        pool configuration example (JSON)
 tools/analyze_profile.py  offline profile analyser
 tests/                  unit tests (CTest)
 docs/                   DESIGN.md (architecture) + STEP1.md (profile format)

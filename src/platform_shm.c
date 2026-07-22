@@ -2,6 +2,8 @@
 
 #include "os/os_shm.h"
 
+#include <stddef.h>
+
 #ifdef MEM_MANAGER_PROFILE
 #  include "profiler/shm_profiler.h"
 #endif
