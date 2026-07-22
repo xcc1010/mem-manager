@@ -103,10 +103,10 @@ tools/analyze_profile.py             offline analyser (Python 3 stdlib)
 - **Debug-only.** The whole of `shm_profiler.c` is wrapped in
   `#ifdef MEM_MANAGER_PROFILE` (set only in Debug). Release = empty TU: no
   profiler code, no dependency at all.
-- **No pthread / no libc lock:** the locks and atomics are the platform's
-  `AAA_*` primitives (`AAASpinLock` + `AAA_SpinLock/Unlock`), so the profiler
-  links without `-lpthread` anywhere (standalone build maps them to C11
-  `<stdatomic.h>` in `os_shm_stub.c`).
+- **No pthread / no libc lock:** the one lock is a C11 `atomic_flag` spinlock,
+  so the profiler links without `-lpthread` anywhere. (Debug-only diagnostic
+  code — it keeps the original stdatomic implementation; only the production
+  pool uses the platform `AAA_*` primitives.)
 - **Two backends** (compile-time, because the DP link environment has no libc —
   see §3 and docs/STEP1.md):
   - **CP (default):** writes JSONL to a per-process file via `open`/`write`,

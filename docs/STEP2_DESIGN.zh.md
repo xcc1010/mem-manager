@@ -132,8 +132,8 @@
 | 查表读 state / 读 nblocks（attach 无锁） | `AAA_Atomic32ReadAcquire` | acquire |
 | meta ready 标志（64 位 magic） | `AAA_Atomic64SetRelease` / `AAA_Atomic64ReadAcquire` | release/acquire |
 
-> 进程本地状态（init 护栏、本地 VA 缓存）同样统一用 `AAA_*` 接口（指针宽度走 64 位原子），
-> 全项目调用点不再直接使用 C11 `<stdatomic.h>`。
+> 池的进程本地状态（init 护栏、本地 VA 缓存）同样统一用 `AAA_*` 接口（指针宽度走 64 位原子），
+> pool 内不再直接使用 C11 `<stdatomic.h>`（profiler 是 Debug-only 诊断代码，保持原有 stdatomic 实现）。
 > 独立构建时 `os_shm_stub.c` 用 stdatomic 提供同款 `AAA_*` 实现，调用点始终直写 `AAA_*`。
 
 **崩溃**：TrySpinLock+兜底 → 降级不死锁；半截创建最多泄漏一个槽（不影响别人）。无全系统死锁。

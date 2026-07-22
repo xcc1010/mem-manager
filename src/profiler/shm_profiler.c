@@ -11,21 +11,22 @@
  *                    them offline. */
 #ifdef MEM_MANAGER_PROFILE
 
-#include "os/aaa_atomic.h"
-
+#include <stdatomic.h>
 #include <stdint.h>
 
 /* Spinlock for the CP file backend (needs no pthread). The data-plane log
  * backend is stateless and uses a reentrancy flag instead, so it is excluded. */
 #ifdef IS_CP
-static AAASpinLock g_lock = AAA_SPINLOCK_INIT(g_lock);
+static atomic_flag g_lock = ATOMIC_FLAG_INIT;
 
 static void mm_lock(void) {
-    (void)AAA_SpinLock(&g_lock);   /* contention is rare, sections are tiny */
+    while (atomic_flag_test_and_set_explicit(&g_lock, memory_order_acquire)) {
+        /* spin: contention is rare and each critical section is tiny */
+    }
 }
 
 static void mm_unlock(void) {
-    (void)AAA_SpinUnlock(&g_lock);
+    atomic_flag_clear_explicit(&g_lock, memory_order_release);
 }
 #endif
 
@@ -150,7 +151,7 @@ static void b_json(Buf* b, const char* s) {
        fprintf(stderr, "[%s] " fmt "\n", (module), __VA_ARGS__)
 #endif
 
-static INT32 g_in_log;
+static atomic_int g_in_log;
 
 static void b_finish(Buf* b) {
     unsigned i = (b->len < b->cap) ? b->len : b->cap - 1;
@@ -159,7 +160,7 @@ static void b_finish(Buf* b) {
 
 void shm_profiler_on_map(const char* op, const char* shmname, const void* addr,
                          UINT32 size, INT32 flags, INT32 ret, const char* pgname) {
-    if (!AAA_Atomic32CmpAndStoreAcquire(&g_in_log, 0, 1)) {
+    if (atomic_exchange_explicit(&g_in_log, 1, memory_order_acquire)) {
         return; /* nested call triggered by the log itself */
     }
     char buf[512];
@@ -184,11 +185,11 @@ void shm_profiler_on_map(const char* op, const char* shmname, const void* addr,
     b_str(&b, "}");
     b_finish(&b);
     LOG_FILE_INFO(MEM_PROFILE_LOG_MODULE, "%s", b.b);
-    AAA_Atomic32SetRelease(&g_in_log, 0);
+    atomic_store_explicit(&g_in_log, 0, memory_order_release);
 }
 
 void shm_profiler_on_unmap(const void* addr, INT32 ret) {
-    if (!AAA_Atomic32CmpAndStoreAcquire(&g_in_log, 0, 1)) {
+    if (atomic_exchange_explicit(&g_in_log, 1, memory_order_acquire)) {
         return;
     }
     char buf[128];
@@ -200,7 +201,7 @@ void shm_profiler_on_unmap(const void* addr, INT32 ret) {
     b_str(&b, "}");
     b_finish(&b);
     LOG_FILE_INFO(MEM_PROFILE_LOG_MODULE, "%s", b.b);
-    AAA_Atomic32SetRelease(&g_in_log, 0);
+    atomic_store_explicit(&g_in_log, 0, memory_order_release);
 }
 
 /* ======================================================================== */
