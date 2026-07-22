@@ -103,8 +103,10 @@ tools/analyze_profile.py             offline analyser (Python 3 stdlib)
 - **Debug-only.** The whole of `shm_profiler.c` is wrapped in
   `#ifdef MEM_MANAGER_PROFILE` (set only in Debug). Release = empty TU: no
   profiler code, no dependency at all.
-- **No pthread / no libc lock:** the one lock is a C11 `atomic_flag` spinlock,
-  so the profiler links without `-lpthread` anywhere.
+- **No pthread / no libc lock:** the locks and atomics are the platform's
+  `AAA_*` primitives (`AAASpinLock` + `AAA_SpinLock/Unlock`), so the profiler
+  links without `-lpthread` anywhere (standalone build maps them to C11
+  `<stdatomic.h>` in `os_shm_stub.c`).
 - **Two backends** (compile-time, because the DP link environment has no libc —
   see §3 and docs/STEP1.md):
   - **CP (default):** writes JSONL to a per-process file via `open`/`write`,
@@ -157,10 +159,11 @@ default OFF keeps `Platform_ShmMap` a pure Step-1 passthrough):
   the same name → slot resolution.
 - **Lock-free attach hot path:** `AAA_Atomic32ReadAcquire` on the published
   entry + `AAA_Atomic32IncReturn` on the refcount. Only creation takes a
-  cross-process spinlock (`AAA_TrySpinLock` + bounded retries). Sync uses the
-  platform's `AAA_*` primitives (standalone build maps them to C11
-  `<stdatomic.h>`; process-local state uses stdatomic directly, no pthread),
-  so the DP plane compiles it.
+  cross-process spinlock (`AAA_TrySpinLock` + bounded retries). All
+  synchronisation — shared meta and process-local alike — uses the platform's
+  `AAA_*` primitives (standalone build maps them to C11 `<stdatomic.h>`;
+  pointer-width state uses the 64-bit atomic interfaces), so the DP plane
+  compiles it.
 - **No split sharing:** a poolable name never falls back to the OS while a
   concurrent create of it may be in flight — the create path spins bounded
   rounds of {try lock, re-check registry} and attaches to the published entry.

@@ -20,9 +20,9 @@
  * The attach hot path is LOCK-FREE (atomically-published entries +
  * AAA_Atomic32IncReturn refcount + cached local base); only creation takes a
  * cross-process spinlock (AAA_TrySpinLock + bounded spin + registry re-check,
- * never deadlocks, never double-maps a name). Cross-process sync uses the
- * platform's AAA_* spinlock/atomic primitives (the standalone build maps them
- * to C11 <stdatomic.h>; process-local state uses stdatomic directly) — no
+ * never deadlocks, never double-maps a name). All synchronisation — shared
+ * meta and process-local alike — uses the platform's AAA_* spinlock/atomic
+ * primitives (the standalone build maps them to C11 <stdatomic.h>) — no
  * pthread — so it also compiles for the C-only DP plane. See
  * docs/STEP2_DESIGN.zh.md §2.2/§2.5. Compiled only when MEM_MANAGER_POOL is
  * defined; otherwise Platform_ShmMap is pure Step-1 passthrough. */

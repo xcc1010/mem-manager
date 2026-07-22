@@ -55,6 +55,19 @@ VOID AAA_Atomic32SetRelease(INT32 *p, INT32 v) {
 INT32 AAA_Atomic32IncReturn(INT32 *p) {
     return atomic_fetch_add_explicit((_Atomic INT32*)p, 1, memory_order_acq_rel) + 1;
 }
+static INT32 cas_impl(void *ptr, INT32 oldv, INT32 newv, memory_order succ) {
+    return atomic_compare_exchange_strong_explicit((_Atomic INT32*)ptr, &oldv,
+            newv, succ, memory_order_relaxed) ? 1 : 0;
+}
+INT32 AAA_Atomic32CmpAndStoreRelaxed(void *p, INT32 o, INT32 n) {
+    return cas_impl(p, o, n, memory_order_relaxed);
+}
+INT32 AAA_Atomic32CmpAndStoreAcquire(void *p, INT32 o, INT32 n) {
+    return cas_impl(p, o, n, memory_order_acquire);
+}
+INT32 AAA_Atomic32CmpAndStoreRelease(void *p, INT32 o, INT32 n) {
+    return cas_impl(p, o, n, memory_order_release);
+}
 UINT64 AAA_Atomic64ReadAcquire(UINT64 *p) {
     return atomic_load_explicit((_Atomic UINT64*)p, memory_order_acquire);
 }

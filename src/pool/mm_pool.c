@@ -18,11 +18,11 @@
  *     AAA_Atomic32ReadAcquire on the entry's published `state`,
  *     AAA_Atomic32IncReturn on the refcount, cached local base. Only the
  *     create path takes the cross-process spinlock (AAA_TrySpinLock + bounded
- *     spin + registry re-check, never deadlocks). Cross-process sync uses the
- *     platform's AAA_* primitives (the standalone build maps them to C11
- *     <stdatomic.h> in os_shm_stub.c; process-local state uses stdatomic
- *     directly) — no pthread — so the same code compiles for the C-only DP
- *     plane.
+ *     spin + registry re-check, never deadlocks). All synchronisation — in the
+ *     shared meta and process-local alike — uses the platform's AAA_*
+ *     primitives (the standalone build maps them to C11 <stdatomic.h> in
+ *     os_shm_stub.c) — no pthread — so the same code compiles for the C-only
+ *     DP plane.
  *   - Config comes from a flat JSON file (MEM_POOL_CONFIG) read by the meta
  *     creator; attachers use the snapshot stored in shared meta.
  *
@@ -54,7 +54,7 @@
 #include "os/os_shm.h"
 #include "os/aaa_atomic.h"
 
-#include <stdatomic.h>   /* process-local atomics only (g_init_state, g_blk_base) */
+#include <stdint.h>     /* uintptr_t for the pointer-width VA cache */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,25 +109,28 @@ typedef struct {
 _Static_assert(sizeof(PoolMeta) <= 0x200000u, "PoolMeta must fit one 2MB OS region");
 
 static PoolMeta*    g_meta;             /* process-local pointer to the shared meta  */
-static _Atomic int  g_init_state;       /* 0 none, 1 in-progress, 2 done             */
+static INT32        g_init_state;       /* 0 none, 2 done (AAA atomics)              */
 
-/* Process-local VA of each pool block. Business flags are VA-differs, so the
- * same pool block lives at a DIFFERENT address in every process: each process
- * attaches the block's OS region by name (once, lazily) and keeps its own
- * base here. The shared meta only ever stores offsets/indices, never pointers. */
-static _Atomic(void*) g_blk_base[MM_MAX_BLOCKS];
+/* Process-local VA of each pool block, stored as UINT64 (pointer-width) so the
+ * platform's 64-bit atomic interfaces apply. Business flags are VA-differs, so
+ * the same pool block lives at a DIFFERENT address in every process: each
+ * process attaches the block's OS region by name (once, lazily) and keeps its
+ * own base here. The shared meta only ever stores offsets/indices, never
+ * pointers. */
+static UINT64 g_blk_base[MM_MAX_BLOCKS];
 
 /* Resolve this process's VA for block i. Same-name attach is idempotent within
  * a process (OS refcount++), so a racy double resolution is harmless. Returns
  * NULL on OS failure. */
 static void* local_base(PoolMeta* m, int i) {
-    void* p = atomic_load_explicit(&g_blk_base[i], memory_order_acquire);
-    if (p) return p;
+    UINT64 v = AAA_Atomic64ReadAcquire(&g_blk_base[i]);
+    if (v) return (void*)(uintptr_t)v;
     char nm[MM_NAME_MAX];
     snprintf(nm, sizeof nm, "mmpool/blk-%d-%d", (int)m->blocks[i].flags, i);
+    void* p = NULL;
     INT32 r = ShmMap(m->blocks[i].flags, nm, m->block_size, &p);
     if (r < 0 || !p) return NULL;
-    atomic_store_explicit(&g_blk_base[i], p, memory_order_release);
+    AAA_Atomic64SetRelease(&g_blk_base[i], (UINT64)(uintptr_t)p);
     return p;
 }
 
@@ -262,18 +265,16 @@ static void meta_attach(const Mm_PoolCfg* cfg) {
 }
 
 void mm_pool_init(const Mm_PoolCfg* cfg) {
-    int expected = 0;
-    if (atomic_compare_exchange_strong_explicit(&g_init_state, &expected, 1,
-            memory_order_acq_rel, memory_order_acquire)) {
-        meta_attach(cfg);
-        atomic_store_explicit(&g_init_state, 2, memory_order_release);
-    } else {
-        while (atomic_load_explicit(&g_init_state, memory_order_acquire) != 2) { /* spin */ }
-    }
+    if (AAA_Atomic32ReadAcquire(&g_init_state) == 2) return;
+    /* meta_attach is idempotent: a concurrent caller just attaches the same
+     * region again and waits on the same ready barrier; the creator is still
+     * unique (OS refcount == 1) and its config wins. No CAS needed. */
+    meta_attach(cfg);
+    AAA_Atomic32SetRelease(&g_init_state, 2);
 }
 
 static void ensure_init(void) {
-    if (atomic_load_explicit(&g_init_state, memory_order_acquire) != 2)
+    if (AAA_Atomic32ReadAcquire(&g_init_state) != 2)
         mm_pool_init(NULL);
 }
 
@@ -285,8 +286,8 @@ static void ensure_init(void) {
 void mm_pool_reset_for_test(void) {
     g_meta = NULL;
     for (int i = 0; i < MM_MAX_BLOCKS; i++)
-        atomic_store_explicit(&g_blk_base[i], NULL, memory_order_release);
-    atomic_store_explicit(&g_init_state, 0, memory_order_release);
+        AAA_Atomic64SetRelease(&g_blk_base[i], 0);
+    AAA_Atomic32SetRelease(&g_init_state, 0);
 }
 
 /* ---------------- cross-process create-path spinlock ---------------- */
@@ -375,7 +376,7 @@ static int carve_bump(PoolMeta* m, UINT32 size, INT32 flags, int* blk_out, UINT3
     INT32 r = ShmMap(flags, nm, m->block_size, &base);
     if (r < 0 || !base) return 0;
 
-    atomic_store_explicit(&g_blk_base[n], base, memory_order_release);  /* our VA */
+    AAA_Atomic64SetRelease(&g_blk_base[n], (UINT64)(uintptr_t)base);  /* our VA */
     PoolBlock* b = &m->blocks[n];
     b->size = m->block_size; b->next = need; b->flags = flags;
     AAA_Atomic32SetRelease(&m->nblocks, n + 1);          /* publish block */
@@ -478,7 +479,7 @@ int mm_pool_try_unmap(void* addr, INT32* ret) {
     if (!m || !addr) return 0;
     INT32 n = AAA_Atomic32ReadAcquire(&m->nblocks);
     for (int i = 0; i < n; i++) {
-        char* lo = (char*)atomic_load_explicit(&g_blk_base[i], memory_order_acquire);
+        char* lo = (char*)(uintptr_t)AAA_Atomic64ReadAcquire(&g_blk_base[i]);
         if (lo && (char*)addr >= lo && (char*)addr < lo + m->blocks[i].size) {
             /* BUMP: no per-slot reclaim; just claim it so the caller doesn't
              * OS-unmap a sub-slot. Full refcount lifecycle lands with slab/freelist. */

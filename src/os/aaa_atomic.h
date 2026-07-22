@@ -16,6 +16,13 @@ extern "C" {
 
 typedef void VOID;
 
+/* Standalone placeholder for the platform's lock magic; the real value comes
+ * from api.h in MEM_MANAGER_USE_API_H builds. */
+#ifndef LOCK_MAGIC_WORD
+#  define LOCK_MAGIC_WORD 0x4C4F434B   /* "LOCK" */
+#endif
+#define AAA_SPINLOCK_INIT(name) {.lock=0,.magic=LOCK_MAGIC_WORD}
+
 typedef struct AAASpinLock {
     UINT32 magic;
     volatile UINT32 lock;
@@ -36,6 +43,10 @@ INT32 AAA_Atomic32Read(INT32 *ptr);              /* acq_rel */
 VOID  AAA_Atomic32SetRelaxed(INT32 *ptr, INT32 v);
 VOID  AAA_Atomic32SetRelease(INT32 *ptr, INT32 v);
 INT32 AAA_Atomic32IncReturn(INT32 *ptr);         /* returns the NEW value */
+/* compare-and-store: 1 = *ptr == oldValue and newValue stored, 0 = no match */
+INT32 AAA_Atomic32CmpAndStoreRelaxed(void *ptr, INT32 oldValue, INT32 newValue);
+INT32 AAA_Atomic32CmpAndStoreAcquire(void *ptr, INT32 oldValue, INT32 newValue);
+INT32 AAA_Atomic32CmpAndStoreRelease(void *ptr, INT32 oldValue, INT32 newValue);
 
 UINT64 AAA_Atomic64ReadAcquire(UINT64 *ptr);
 VOID   AAA_Atomic64SetRelease(UINT64 *ptr, UINT64 v);
