@@ -121,14 +121,19 @@
 **(5) 释放**：detach 用原子自减；减到 0 时置 `state=TOMBSTONE`（不立刻动 free list）；
 切槽方持锁时顺带回收墓碑槽。init-once/shutdown-free 下几乎只在收尾回收。
 
-**用 DP 原语实现**：
+**用 DP 原语实现**（接口名以内部 `api.h` 为准，已实现）：
 
 | 角色 | 原语 | 内存序 |
 |---|---|---|
-| 创建路径互斥（切槽/建块/名字增删） | `TrySpinLock`/`SpinUnlock`（拿不到→透传兜底） | — |
-| refcount 增减（attach/detach） | 原子自加/自减 | acq_rel |
-| 发布表项（插入最后一步写 state） | `Atomic32Set`（release） | release |
-| 查表读 state（attach 无锁） | `Atomic32ReadAcquire` | acquire |
+| 创建路径互斥（切槽/建块/名字增删） | `AAA_TrySpinLock`/`AAA_SpinUnlock`（拿不到→有界自旋+重查注册表） | — |
+| 锁初始化（meta 创建者，发布 ready 前） | `AAA_InitSpinLock` | — |
+| refcount 自加（attach，返回新值） | `AAA_Atomic32IncReturn` | acq_rel |
+| 发布表项（插入最后一步写 state）/ 发布 nblocks | `AAA_Atomic32SetRelease` | release |
+| 查表读 state / 读 nblocks（attach 无锁） | `AAA_Atomic32ReadAcquire` | acquire |
+| meta ready 标志（64 位 magic） | `AAA_Atomic64SetRelease` / `AAA_Atomic64ReadAcquire` | release/acquire |
+
+> 进程本地状态（init 护栏、本地 VA 缓存）用 C11 `<stdatomic.h>`（编译器内建、无 libc 依赖）。
+> 独立构建时 `os_shm_stub.c` 用 stdatomic 提供同款 `AAA_*` 实现，调用点始终直写 `AAA_*`。
 
 **崩溃**：TrySpinLock+兜底 → 降级不死锁；半截创建最多泄漏一个槽（不影响别人）。无全系统死锁。
 

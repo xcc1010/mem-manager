@@ -9,10 +9,58 @@
  * cross-process attach path (creator ret==1 vs attacher ret>1) — see the pool's
  * mm_pool_reset_for_test() which simulates a second process re-attaching. */
 #include "os/os_shm.h"
+#include "os/aaa_atomic.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ---- AAA_* sync primitives: standalone equivalents via C11 <stdatomic.h> ----
+ * Same semantics as the internal api.h versions (see aaa_atomic.h); only the
+ * `lock` word of AAASpinLock is used here. */
+
+VOID AAA_InitSpinLock(AAASpinLock *l) {
+    l->magic = 0;
+    atomic_store_explicit((_Atomic UINT32*)&l->lock, 0, memory_order_relaxed);
+    l->pidmask = 0; l->lr = 0; l->tsc = 0; l->nextoffset = 0; l->usingNum = 0;
+}
+INT32 AAA_TrySpinLock(AAASpinLock *l) {
+    UINT32 expected = 0;
+    return atomic_compare_exchange_strong_explicit((_Atomic UINT32*)&l->lock,
+            &expected, 1, memory_order_acquire, memory_order_relaxed) ? 0 : -1;
+}
+INT32 AAA_SpinLock(AAASpinLock *l) {
+    while (AAA_TrySpinLock(l) != 0) { /* spin */ }
+    return 0;
+}
+INT32 AAA_SpinUnlock(AAASpinLock *l) {
+    atomic_store_explicit((_Atomic UINT32*)&l->lock, 0, memory_order_release);
+    return 0;
+}
+
+INT32 AAA_Atomic32ReadAcquire(INT32 *p) {
+    return atomic_load_explicit((_Atomic INT32*)p, memory_order_acquire);
+}
+INT32 AAA_Atomic32Read(INT32 *p) {
+    /* api.h documents this as acq_rel; a pure load lowers to acquire */
+    return atomic_load_explicit((_Atomic INT32*)p, memory_order_acquire);
+}
+VOID AAA_Atomic32SetRelaxed(INT32 *p, INT32 v) {
+    atomic_store_explicit((_Atomic INT32*)p, v, memory_order_relaxed);
+}
+VOID AAA_Atomic32SetRelease(INT32 *p, INT32 v) {
+    atomic_store_explicit((_Atomic INT32*)p, v, memory_order_release);
+}
+INT32 AAA_Atomic32IncReturn(INT32 *p) {
+    return atomic_fetch_add_explicit((_Atomic INT32*)p, 1, memory_order_acq_rel) + 1;
+}
+UINT64 AAA_Atomic64ReadAcquire(UINT64 *p) {
+    return atomic_load_explicit((_Atomic UINT64*)p, memory_order_acquire);
+}
+VOID AAA_Atomic64SetRelease(UINT64 *p, UINT64 v) {
+    atomic_store_explicit((_Atomic UINT64*)p, v, memory_order_release);
+}
 
 #define STUB_MAX       8192
 #define STUB_NAME_MAX  128

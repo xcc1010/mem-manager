@@ -155,10 +155,12 @@ default OFF keeps `Platform_ShmMap` a pure Step-1 passthrough):
   (flags 1, CP+DP inter-PG; it stores only offsets/indices, never pointers);
   the creator publishes a ready flag, other processes/planes attach and get
   the same name → slot resolution.
-- **Lock-free attach hot path:** acquire-load of the published entry + atomic
-  refcount++. Only creation takes a cross-process spinlock, via `TrySpinLock`
-  + bounded retries. All sync is C11 `<stdatomic.h>` (no pthread), so the DP
-  plane compiles it.
+- **Lock-free attach hot path:** `AAA_Atomic32ReadAcquire` on the published
+  entry + `AAA_Atomic32IncReturn` on the refcount. Only creation takes a
+  cross-process spinlock (`AAA_TrySpinLock` + bounded retries). Sync uses the
+  platform's `AAA_*` primitives (standalone build maps them to C11
+  `<stdatomic.h>`; process-local state uses stdatomic directly, no pthread),
+  so the DP plane compiles it.
 - **No split sharing:** a poolable name never falls back to the OS while a
   concurrent create of it may be in flight — the create path spins bounded
   rounds of {try lock, re-check registry} and attaches to the published entry.
