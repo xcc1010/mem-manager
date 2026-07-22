@@ -34,7 +34,7 @@ extern "C" {
 typedef struct {
     int          enable;              /* 0 -> everything passes through (one-key rollback = Step 1) */
     UINT32       threshold;           /* size >= threshold -> passthrough        (default 0x200000) */
-    UINT32       block_size;          /* OS block size carved from               (default 0x200000) */
+    UINT32       block_size;          /* OS block size carved from              (default 0x4000000) */
     UINT32       poolable_flags_mask; /* bit f set -> flags==f may pool        (default 1<<1) */
 } Mm_PoolCfg;
 

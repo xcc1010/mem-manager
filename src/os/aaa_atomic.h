@@ -48,8 +48,8 @@ INT32 AAA_Atomic32CmpAndStoreRelaxed(void *ptr, INT32 oldValue, INT32 newValue);
 INT32 AAA_Atomic32CmpAndStoreAcquire(void *ptr, INT32 oldValue, INT32 newValue);
 INT32 AAA_Atomic32CmpAndStoreRelease(void *ptr, INT32 oldValue, INT32 newValue);
 
-UINT64 AAA_Atomic64ReadAcquire(UINT64 *ptr);
-VOID   AAA_Atomic64SetRelease(UINT64 *ptr, UINT64 v);
+INT64 AAA_Atomic64ReadAcquire(INT64 *ptr);
+VOID  AAA_Atomic64SetRelease(INT64 *ptr, INT64 v);
 
 #  ifdef __cplusplus
 }

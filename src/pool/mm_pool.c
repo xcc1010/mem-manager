@@ -111,26 +111,26 @@ _Static_assert(sizeof(PoolMeta) <= 0x200000u, "PoolMeta must fit one 2MB OS regi
 static PoolMeta*    g_meta;             /* process-local pointer to the shared meta  */
 static INT32        g_init_state;       /* 0 none, 2 done (AAA atomics)              */
 
-/* Process-local VA of each pool block, stored as UINT64 (pointer-width) so the
+/* Process-local VA of each pool block, stored as INT64 (pointer-width) so the
  * platform's 64-bit atomic interfaces apply. Business flags are VA-differs, so
  * the same pool block lives at a DIFFERENT address in every process: each
  * process attaches the block's OS region by name (once, lazily) and keeps its
  * own base here. The shared meta only ever stores offsets/indices, never
  * pointers. */
-static UINT64 g_blk_base[MM_MAX_BLOCKS];
+static INT64 g_blk_base[MM_MAX_BLOCKS];
 
 /* Resolve this process's VA for block i. Same-name attach is idempotent within
  * a process (OS refcount++), so a racy double resolution is harmless. Returns
  * NULL on OS failure. */
 static void* local_base(PoolMeta* m, int i) {
-    UINT64 v = AAA_Atomic64ReadAcquire(&g_blk_base[i]);
+    INT64 v = AAA_Atomic64ReadAcquire(&g_blk_base[i]);
     if (v) return (void*)(uintptr_t)v;
     char nm[MM_NAME_MAX];
     snprintf(nm, sizeof nm, "mmpool/blk-%d-%d", (int)m->blocks[i].flags, i);
     void* p = NULL;
     INT32 r = ShmMap(m->blocks[i].flags, nm, m->block_size, &p);
     if (r < 0 || !p) return NULL;
-    AAA_Atomic64SetRelease(&g_blk_base[i], (UINT64)(uintptr_t)p);
+    AAA_Atomic64SetRelease(&g_blk_base[i], (INT64)(uintptr_t)p);
     return p;
 }
 
@@ -219,7 +219,7 @@ void mm_pool_default_cfg(Mm_PoolCfg* cfg) {
     if (!cfg) return;
     cfg->enable              = 1;
     cfg->threshold           = 0x200000u;
-    cfg->block_size          = 0x200000u;
+    cfg->block_size          = 0x4000000u;          /* 64MB blocks (2026-07 trial value) */
     cfg->poolable_flags_mask = (1u << 1);           /* v1: flags=1 only (VA-differs, CP+DP inter-PG) */
     const char* path = getenv("MEM_POOL_CONFIG");
     if (path && *path) mm_pool_load_config(path, cfg);   /* file overrides defaults */
@@ -254,10 +254,10 @@ static void meta_attach(const Mm_PoolCfg* cfg) {
         AAA_InitSpinLock(&m->lock);     /* explicit init; memset alone is not enough */
         AAA_Atomic32SetRelaxed(&m->nblocks, 0);
         /* publish everything (incl. the initialised lock) with a release */
-        AAA_Atomic64SetRelease((UINT64*)&m->ready, MM_META_MAGIC);
+        AAA_Atomic64SetRelease((INT64*)&m->ready, (INT64)MM_META_MAGIC);
     } else {                            /* attacher: wait for the creator */
         long spins = 0;
-        while (AAA_Atomic64ReadAcquire((UINT64*)&m->ready) != MM_META_MAGIC) {
+        while (AAA_Atomic64ReadAcquire((INT64*)&m->ready) != (INT64)MM_META_MAGIC) {
             if (++spins > MM_READY_SPINS) return;   /* creator died mid-init -> passthrough */
         }
     }
@@ -376,7 +376,7 @@ static int carve_bump(PoolMeta* m, UINT32 size, INT32 flags, int* blk_out, UINT3
     INT32 r = ShmMap(flags, nm, m->block_size, &base);
     if (r < 0 || !base) return 0;
 
-    AAA_Atomic64SetRelease(&g_blk_base[n], (UINT64)(uintptr_t)base);  /* our VA */
+    AAA_Atomic64SetRelease(&g_blk_base[n], (INT64)(uintptr_t)base);  /* our VA */
     PoolBlock* b = &m->blocks[n];
     b->size = m->block_size; b->next = need; b->flags = flags;
     AAA_Atomic32SetRelease(&m->nblocks, n + 1);          /* publish block */

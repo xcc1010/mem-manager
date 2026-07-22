@@ -332,7 +332,7 @@ v1 配置项（见 `config/pool.json`）：
 {
   "enable": true,                  // false = 全透传（等价 Step 1，一键回滚）
   "threshold": "0x200000",         // ≥ 此值透传 OS（大块不进池）；数字或 "0x.." 字符串
-  "block_size": "0x200000",        // 池块大小（OS 申请粒度）
+  "block_size": "0x4000000",     // 池块大小（OS 申请粒度，默认 64MB；须为 2MB 倍数）
   "poolable_flags": [1]            // 只池化 flags=1（VA-differs，CP+DP 进程组间）
 }
 ```

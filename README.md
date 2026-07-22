@@ -50,8 +50,8 @@ With the pool enabled, small poolable requests (VA-same flags 4/5, size below
 through to the OS unchanged. Configuration (see [config/pool.json](config/pool.json)):
 
 ```json
-{ "enable": true, "threshold": "0x200000", "block_size": "0x200000",
-  "poolable_flags": [4, 5] }
+{ "enable": true, "threshold": "0x200000", "block_size": "0x4000000",
+  "poolable_flags": [1] }
 ```
 
 - The meta creator reads the JSON file named by `MEM_POOL_CONFIG` (flat object;

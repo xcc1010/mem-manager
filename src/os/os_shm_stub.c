@@ -68,11 +68,11 @@ INT32 AAA_Atomic32CmpAndStoreAcquire(void *p, INT32 o, INT32 n) {
 INT32 AAA_Atomic32CmpAndStoreRelease(void *p, INT32 o, INT32 n) {
     return cas_impl(p, o, n, memory_order_release);
 }
-UINT64 AAA_Atomic64ReadAcquire(UINT64 *p) {
-    return atomic_load_explicit((_Atomic UINT64*)p, memory_order_acquire);
+INT64 AAA_Atomic64ReadAcquire(INT64 *p) {
+    return atomic_load_explicit((_Atomic INT64*)p, memory_order_acquire);
 }
-VOID AAA_Atomic64SetRelease(UINT64 *p, UINT64 v) {
-    atomic_store_explicit((_Atomic UINT64*)p, v, memory_order_release);
+VOID AAA_Atomic64SetRelease(INT64 *p, INT64 v) {
+    atomic_store_explicit((_Atomic INT64*)p, v, memory_order_release);
 }
 
 #define STUB_MAX       8192

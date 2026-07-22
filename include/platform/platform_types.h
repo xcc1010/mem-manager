@@ -11,6 +11,7 @@
 #  include <stdint.h>
 typedef int32_t  INT32;
 typedef uint32_t UINT32;
+typedef int64_t  INT64;
 typedef uint64_t UINT64;
 /* Standalone build has no api.h and hence no IS_CP. Default to the control
  * plane (file profiler backend, ShmMapOnPg present); pass -DIS_DP to exercise
