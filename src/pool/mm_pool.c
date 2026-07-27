@@ -109,7 +109,7 @@ typedef struct {
 _Static_assert(sizeof(PoolMeta) <= 0x200000u, "PoolMeta must fit one 2MB OS region");
 
 static PoolMeta*    g_meta;             /* process-local pointer to the shared meta  */
-static INT32        g_init_state;       /* 0 none, 2 done (AAA atomics)              */
+static INT32        g_init_state;       /* 0 none, 1 in-progress, 2 done (AAA atomics) */
 
 /* Process-local VA of each pool block, stored as INT64 (pointer-width) so the
  * platform's 64-bit atomic interfaces apply. Business flags are VA-differs, so
@@ -266,11 +266,27 @@ static void meta_attach(const Mm_PoolCfg* cfg) {
 
 void mm_pool_init(const Mm_PoolCfg* cfg) {
     if (AAA_Atomic32ReadAcquire(&g_init_state) == 2) return;
-    /* meta_attach is idempotent: a concurrent caller just attaches the same
-     * region again and waits on the same ready barrier; the creator is still
-     * unique (OS refcount == 1) and its config wins. No CAS needed. */
-    meta_attach(cfg);
-    AAA_Atomic32SetRelease(&g_init_state, 2);
+    /* In-process init-once gate: exactly ONE thread per process enters
+     * meta_attach (issuing the single OS ShmMap for the meta). Letting every
+     * concurrent caller into meta_attach relied on the OS serialising
+     * same-name creation (refcount==1 -> unique creator); if the platform's
+     * ShmMap does not serialise concurrent same-name maps from one process,
+     * two threads both take the creator branch and the loser's memset() /
+     * AAA_InitSpinLock() runs while attachers are already past the ready
+     * barrier and holding the lock -> coredump. The CAS gate removes that
+     * assumption. */
+    if (AAA_Atomic32CmpAndStoreAcquire(&g_init_state, 0, 1)) {
+        meta_attach(cfg);               /* single in-process creator/attacher */
+        AAA_Atomic32SetRelease(&g_init_state, 2);
+        return;
+    }
+    /* Lost the race: bounded wait for the winner to publish g_meta. Never
+     * re-enter meta_attach — a second in-process ShmMap of the meta is what
+     * we are gating out. On timeout the winner is presumed dead; state stays
+     * 1 and the pool degrades to passthrough rather than racing a retry. */
+    long spins = 0;
+    while (AAA_Atomic32ReadAcquire(&g_init_state) != 2)
+        if (++spins > MM_READY_SPINS) return;
 }
 
 static void ensure_init(void) {

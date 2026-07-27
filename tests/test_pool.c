@@ -143,6 +143,35 @@ static void test_conflict(void) {
     printf("conflict: ok\n");
 }
 
+/* ---- concurrency: simultaneous mm_pool_init from many threads ----
+ * Regression test for the init race: previously every concurrent caller
+ * entered meta_attach together, relying on the OS to serialise same-name
+ * creation (unique refcount==1 creator); a platform ShmMap that does not
+ * serialise that case lets two threads both take the creator branch, and the
+ * loser's memset()/lock-reinit hits metadata already in use -> coredump. The
+ * CAS init gate (0 -> 1 -> 2) must let exactly one thread attach the meta. */
+static void* init_worker(void* arg) {
+    (void)arg;
+    mm_pool_init(NULL);                      /* all threads race the init gate */
+    void* p = NULL; INT32 r;
+    r = Platform_ShmMap(1, "init/race", 256, &p);
+    assert(r >= 1 && p);                     /* pool usable right after init   */
+    return NULL;
+}
+
+static void test_concurrent_init(void) {
+    mm_pool_reset_for_test();                /* forget our attachment -> re-init */
+    pthread_t th[NT];
+    for (intptr_t i = 0; i < NT; i++) assert(pthread_create(&th[i], NULL, init_worker, (void*)i) == 0);
+    for (int i = 0; i < NT; i++) pthread_join(th[i], NULL);
+
+    /* after the storm: init done, shared name resolves to one slot */
+    void* p = NULL; INT32 r;
+    r = Platform_ShmMap(1, "init/race", 256, &p);
+    assert(r >= 2 && p);                     /* attach to the existing entry   */
+    printf("concurrent init: ok (%d threads raced mm_pool_init)\n", NT);
+}
+
 int main(void) {
     Mm_PoolCfg cfg;
     mm_pool_default_cfg(&cfg);
@@ -150,11 +179,12 @@ int main(void) {
     cfg.threshold = 0x200000;
     cfg.block_size = 0x200000;
     cfg.poolable_flags_mask = (1u << 1) | (1u << 2);
-    mm_pool_init(&cfg);           /* explicit init before threads (see note below) */
+    mm_pool_init(&cfg);           /* explicit init: creator's config wins */
 
     test_functional();
     test_concurrency();
     test_cross_process_attach();
+    test_concurrent_init();
     test_json_config();
     test_conflict();
 

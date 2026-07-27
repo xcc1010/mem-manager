@@ -54,7 +54,9 @@ int mm_pool_load_config(const char* path, Mm_PoolCfg* cfg);
  * MEM_POOL_ENABLE=0 thus stays the one-key rollback even with a config file. */
 void mm_pool_default_cfg(Mm_PoolCfg* cfg);
 
-/* Initialise the pool from cfg (idempotent; pass NULL to use mm_pool_default_cfg).
+/* Initialise the pool from cfg (thread-safe init-once; pass NULL to use
+ * mm_pool_default_cfg). A CAS gate serialises concurrent callers: exactly one
+ * thread per process attaches/creates the shared meta, the rest wait for it.
  * Called lazily by the try_* entry points if not called explicitly. */
 void mm_pool_init(const Mm_PoolCfg* cfg);
 
