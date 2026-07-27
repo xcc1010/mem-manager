@@ -108,8 +108,22 @@ typedef struct {
  * would silently overflow at compile time. */
 _Static_assert(sizeof(PoolMeta) <= 0x200000u, "PoolMeta must fit one 2MB OS region");
 
-static PoolMeta*    g_meta;             /* process-local pointer to the shared meta  */
+/* g_meta is stored as a pointer-width INT64 so that BOTH publication (by the
+ * init-winning thread) and every read go through the platform's 64-bit atomic
+ * interfaces. A plain global pointer read races the publication and hands the
+ * optimiser licence to sink/speculate the first meta dereference above the
+ * NULL guard — observed as a DP-boot coredump: ldr w0,[x20,#192] (m->enable,
+ * offsetof 192 with the platform's 176-byte AAASpinLock) with x20 = g_meta
+ * still unpublished (NULL). The opaque atomic accessors forbid that. */
+static INT64        g_meta_va;
 static INT32        g_init_state;       /* 0 none, 1 in-progress, 2 done (AAA atomics) */
+
+static PoolMeta* meta_get(void) {
+    return (PoolMeta*)(uintptr_t)AAA_Atomic64ReadAcquire(&g_meta_va);
+}
+static void meta_put(PoolMeta* m) {
+    AAA_Atomic64SetRelease(&g_meta_va, (INT64)(uintptr_t)m);
+}
 
 /* Process-local VA of each pool block, stored as INT64 (pointer-width) so the
  * platform's 64-bit atomic interfaces apply. Business flags are VA-differs, so
@@ -261,7 +275,7 @@ static void meta_attach(const Mm_PoolCfg* cfg) {
             if (++spins > MM_READY_SPINS) return;   /* creator died mid-init -> passthrough */
         }
     }
-    g_meta = m;
+    meta_put(m);                        /* atomic release publication (see g_meta_va) */
 }
 
 void mm_pool_init(const Mm_PoolCfg* cfg) {
@@ -300,7 +314,7 @@ static void ensure_init(void) {
  * block-VA cache is also dropped, simulating a fresh process that must
  * re-resolve every pool block's VA via local_base(). */
 void mm_pool_reset_for_test(void) {
-    g_meta = NULL;
+    meta_put(NULL);
     for (int i = 0; i < MM_MAX_BLOCKS; i++)
         AAA_Atomic64SetRelease(&g_blk_base[i], 0);
     AAA_Atomic32SetRelease(&g_init_state, 0);
@@ -430,8 +444,10 @@ static int attach(PoolMeta* m, NameEntry* e, void** out, INT32* ret) {
 
 int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret) {
     ensure_init();
-    PoolMeta* m = g_meta;
-    if (!m || !m->enable)                    return 0;
+    PoolMeta* m = meta_get();      /* opaque atomic load: the NULL guard below
+                                      cannot be reordered/speculated away     */
+    if (!m)                                  return 0;
+    if (!m->enable)                          return 0;
     if (!out || !name)                       return 0;
     if (name_len(name, MM_NAME_MAX) >= MM_NAME_MAX) return 0;
     if (!poolable(m, flags, size))           return 0;   /* passthrough (incl. big attach) */
@@ -491,7 +507,7 @@ conflict:
 
 int mm_pool_try_unmap(void* addr, INT32* ret) {
     ensure_init();
-    PoolMeta* m = g_meta;
+    PoolMeta* m = meta_get();      /* opaque atomic load (see mm_pool_try_map) */
     if (!m || !addr) return 0;
     INT32 n = AAA_Atomic32ReadAcquire(&m->nblocks);
     for (int i = 0; i < n; i++) {
