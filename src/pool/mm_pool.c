@@ -137,19 +137,21 @@ static void meta_put(PoolMeta* m) {
  * Wire the platform's pid / vcpu-id APIs through these macros; ensure_init()
  * then detects the context switch, drops the stale caches and re-attaches in
  * the current context (DP threads are core-pinned, so the context cannot
- * change mid-call). In MEM_MANAGER_USE_API_H builds the defaults bind the
- * platform's AAA_GetPgId()/AAA_GetVcpuId(); otherwise the check is compiled
- * out (zero cost). Either macro can still be overridden at compile time. */
+ * change mid-call). AAA_GetPgId/AAA_GetVcpuId exist only in the DP link
+ * environment, so the defaults bind them on the DP (MEM_MANAGER_USE_API_H
+ * without IS_CP) and compile the check out everywhere else (zero cost). On
+ * the CP the watchdog is therefore off — single process, no fork observed;
+ * override MM_POOL_GETPID (e.g. getpid) if that ever changes. */
 #ifndef MM_POOL_GETPID
-#  ifdef MEM_MANAGER_USE_API_H
-#    define MM_POOL_GETPID()  ((int)AAA_GetPgId())   /* DP: pg id; CP/Linux: -1 */
+#  if defined(MEM_MANAGER_USE_API_H) && !defined(IS_CP)
+#    define MM_POOL_GETPID()  ((int)AAA_GetPgId())   /* DP-only symbol: pg id   */
 #  else
-#    define MM_POOL_GETPID()  0
-#  endif
+#    define MM_POOL_GETPID()  0    /* CP/standalone: watchdog off (AAA_GetPgId  */
+#  endif                           /* does not exist in the CP link env)        */
 #endif
 #ifndef MM_POOL_GETVCPU
-#  ifdef MEM_MANAGER_USE_API_H
-#    define MM_POOL_GETVCPU() ((int)AAA_GetVcpuId()) /* DP: logical core no.    */
+#  if defined(MEM_MANAGER_USE_API_H) && !defined(IS_CP)
+#    define MM_POOL_GETVCPU() ((int)AAA_GetVcpuId()) /* DP-only symbol: core no.*/
 #  else
 #    define MM_POOL_GETVCPU() 0
 #  endif
