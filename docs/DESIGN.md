@@ -179,9 +179,10 @@ default OFF keeps `Platform_ShmMap` a pure Step-1 passthrough):
   (different sharing scopes; blocks are segregated per flags).
 - **Config:** a flat JSON file (path from `MEM_POOL_CONFIG`; see
   `config/pool.json`) read by the meta creator; attachers use the snapshot in
-  shared meta. `MEM_POOL_*` env vars still override the file — on the creator.
-  Note the rollback precondition: `enable=0` only takes effect when the meta
-  region is (re)created, i.e. after all processes have detached from it.
+  shared meta. Exactly two sources — built-in defaults < JSON file; there are
+  no per-knob env overrides. Rollback = `"enable": false` in the file, with
+  the precondition that it only takes effect when the meta region is
+  (re)created, i.e. after all processes have detached from it.
 
 Deferred (not in v1): per-slot reclaim (needs slab/freelist), OnPg/per-NUMA
 pools (`Platform_ShmMapOnPg` still passes through), pooled-unmap refcounting

@@ -323,8 +323,8 @@ INT32 Platform_ShmUnmap(void* addr):
   无第三方库），只认扁平键值 + 一个整数数组，未知键忽略。
 - **解析放 CP 端 / 元数据创建方**：读文件后把结果填 `Mm_PoolCfg` 存进元数据 shm。
 - **DP 不读文件**：attach 元数据 shm 即拿到同一份 `cfg` 快照。
-- 路径由 `MEM_POOL_CONFIG` 环境变量给；优先级：**内置缺省 < JSON 文件 < `MEM_POOL_*` 环境变量**
-  （`MEM_POOL_ENABLE=0` 依旧是一键回滚）。
+- 路径由 `MEM_POOL_CONFIG` 环境变量给（仅用于定位文件）；**配置来源只有两个：
+  内置缺省 < JSON 文件**，没有任何逐项环境变量覆盖。回滚 = 文件里 `"enable": false`。
 
 v1 配置项（见 `config/pool.json`）：
 

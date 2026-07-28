@@ -57,11 +57,9 @@ through to the OS unchanged. Configuration (see [config/pool.json](config/pool.j
 - The meta creator reads the JSON file named by `MEM_POOL_CONFIG` (flat object;
   unknown keys ignored; sizes accept decimal numbers or `"0x.."` strings) and
   publishes the resulting config in shared metadata — attaching processes never
-  read the file.
-- Precedence: built-in defaults < JSON file < `MEM_POOL_*` env vars
-  (`MEM_POOL_ENABLE`, `MEM_POOL_THRESHOLD`, `MEM_POOL_BLOCK_SIZE`,
-  `MEM_POOL_FLAGS`). `MEM_POOL_ENABLE=0` is the one-key rollback to pure
-  pass-through.
+  read the file. `MEM_POOL_CONFIG` is the only environment variable used, and
+  only to locate the file; there are no per-knob env overrides.
+- Precedence: built-in defaults < JSON file. Rollback = `"enable": false`.
 
 ## Run
 

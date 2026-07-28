@@ -39,19 +39,19 @@ typedef struct {
 } Mm_PoolCfg;
 
 /* Parse a flat JSON config file into cfg (only keys present are overwritten).
+ * CP ONLY: the DP has no file I/O — there this just returns -1 and pool
+ * config always comes from the shared-meta snapshot.
  * Returns 0 on success, -1 if the file cannot be read. Unknown keys are
  * ignored. Format (see config/pool.json):
- *   { "enable": true, "threshold": "0x200000", "block_size": "0x200000",
- *     "poolable_flags": [4, 5] }
+ *   { "enable": true, "threshold": "0x200000", "block_size": "0x4000000",
+ *     "poolable_flags": [1] }
  * Byte sizes accept a JSON number (decimal) or a string ("0x.." hex ok). */
 int mm_pool_load_config(const char* path, Mm_PoolCfg* cfg);
 
-/* Fill cfg with defaults, then apply (in increasing priority):
- *   1. the JSON file named by MEM_POOL_CONFIG (if set and readable), then
- *   2. MEM_POOL_* environment overrides:
- *      MEM_POOL_ENABLE, MEM_POOL_THRESHOLD, MEM_POOL_BLOCK_SIZE,
- *      MEM_POOL_FLAGS (mask). Numeric values accept 0x.. hex or decimal.
- * MEM_POOL_ENABLE=0 thus stays the one-key rollback even with a config file. */
+/* Fill cfg with the built-in defaults, then let the JSON file named by
+ * MEM_POOL_CONFIG override them (CP only; MEM_POOL_CONFIG is the only
+ * environment variable used, and only to locate the file — there are no
+ * per-knob env overrides). Rollback = "enable": false in the file. */
 void mm_pool_default_cfg(Mm_PoolCfg* cfg);
 
 /* Initialise the pool from cfg (thread-safe init-once; pass NULL to use

@@ -19,8 +19,8 @@ endif()
 option(MEM_MANAGER_USE_API_H "Pull types and OS Shm* from the real api.h" OFF)
 option(MEM_MANAGER_BUILD_TESTS "Build unit tests" ON)
 # Step-2 pool allocator. OFF -> Platform_ShmMap is pure Step-1 passthrough.
-# ON  -> small poolable requests are carved from shared OS blocks (bump strategy,
-#        strategy-pluggable). Runtime rollback via MEM_POOL_ENABLE=0.
+# ON  -> small poolable requests are carved from shared OS blocks (bump).
+#        Runtime rollback: "enable": false in the JSON config file.
 option(MEM_MANAGER_POOL "Enable the Step-2 shared-memory pool allocator" OFF)
 
 find_package(Threads REQUIRED)

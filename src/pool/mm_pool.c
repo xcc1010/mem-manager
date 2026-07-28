@@ -54,10 +54,20 @@
 #include "os/os_shm.h"
 #include "os/aaa_atomic.h"
 
-#include <stdint.h>     /* uintptr_t for the pointer-width VA cache */
-#include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* <stdio.h> is CP-only: the DP has no full libc and the platform's own
+ * headers define FILE differently — including <stdio.h> there fails with
+ * "conflicting types for FILE". On the DP only snprintf is used; declare it
+ * directly. Config-file reading and env overrides are CP-only as well: the
+ * DP attaches the shared meta and uses its snapshot (设计文档.md §5.2). */
+#ifdef IS_CP
+#  include <stdio.h>
+#else
+int snprintf(char* s, size_t n, const char* fmt, ...);
+#endif
 
 #define MM_MAX_BLOCKS    1024
 #define MM_NAME_CAP      8192            /* open-addressing table; power of two   */
@@ -194,15 +204,12 @@ static void* local_base(PoolMeta* m, int i) {
     return p;
 }
 
-/* ---------------- config ---------------- */
+/* ---------------- config: built-in defaults + JSON file (CP only) -------- */
 
-static UINT32 env_u32(const char* key, UINT32 dflt) {
-    const char* v = getenv(key);
-    return (v && *v) ? (UINT32)strtoul(v, NULL, 0) : dflt;
-}
-
-/* ---------------- flat-JSON config file ---------------- */
-/* Minimal hand-written parser for a FLAT JSON object (plus a flat int array).
+#ifdef IS_CP
+/* env_u32 was dropped: configuration comes from exactly two places —
+ * the built-in defaults and the JSON file (path from MEM_POOL_CONFIG).
+ * Minimal hand-written parser for a FLAT JSON object (plus a flat int array).
  * Deliberately tiny: no third-party deps, and only the meta creator (CP /
  * platform init) ever reads the file — attachers use the snapshot in shared
  * meta. Lenient on whitespace; unknown keys ignored. */
@@ -274,6 +281,16 @@ int mm_pool_load_config(const char* path, Mm_PoolCfg* cfg) {
     free(buf);
     return 0;
 }
+#endif /* IS_CP (JSON config file) */
+
+#ifndef IS_CP
+/* DP has no file I/O: config comes from the shared-meta snapshot. Keep the
+ * public symbol so DP links never miss it. */
+int mm_pool_load_config(const char* path, Mm_PoolCfg* cfg) {
+    (void)path; (void)cfg;
+    return -1;
+}
+#endif
 
 void mm_pool_default_cfg(Mm_PoolCfg* cfg) {
     if (!cfg) return;
@@ -281,13 +298,10 @@ void mm_pool_default_cfg(Mm_PoolCfg* cfg) {
     cfg->threshold           = 0x200000u;
     cfg->block_size          = 0x4000000u;          /* 64MB blocks (2026-07 trial value) */
     cfg->poolable_flags_mask = (1u << 1);           /* v1: flags=1 only (VA-differs, CP+DP inter-PG) */
-    const char* path = getenv("MEM_POOL_CONFIG");
+#ifdef IS_CP
+    const char* path = getenv("MEM_POOL_CONFIG");   /* the only env var: where the file is */
     if (path && *path) mm_pool_load_config(path, cfg);   /* file overrides defaults */
-    /* env vars override the file: MEM_POOL_ENABLE=0 stays the one-key rollback */
-    cfg->enable              = (int)env_u32("MEM_POOL_ENABLE", (UINT32)cfg->enable);
-    cfg->threshold           = env_u32("MEM_POOL_THRESHOLD", cfg->threshold);
-    cfg->block_size          = env_u32("MEM_POOL_BLOCK_SIZE", cfg->block_size);
-    cfg->poolable_flags_mask = env_u32("MEM_POOL_FLAGS", cfg->poolable_flags_mask);
+#endif
 }
 
 /* ---------------- init-once (attach or create the shared meta) ---------------- */
@@ -305,8 +319,7 @@ static void meta_attach(const Mm_PoolCfg* cfg) {
         Mm_PoolCfg c;
         if (cfg) c = *cfg; else mm_pool_default_cfg(&c);
         if (c.enable && (c.block_size == 0 || c.threshold == 0)) {
-            fprintf(stderr, "mem-manager: bad pool config (block_size/threshold = 0);"
-                            " pool disabled\n");
+            mm_pool_log("bad pool config (block_size/threshold = 0); pool disabled");
             c.enable = 0;
         }
         m->enable              = c.enable;
