@@ -125,6 +125,48 @@ static void meta_put(PoolMeta* m) {
     AAA_Atomic64SetRelease(&g_meta_va, (INT64)(uintptr_t)m);
 }
 
+/* ---------------- execution-context identity (fork / per-vcpu guard) ----------------
+ * The process-local caches (g_meta_va, g_blk_base) are only valid in the
+ * execution context that created them. Two platform realities can invalidate
+ * them:
+ *   S1: the platform FORKS processes after the pool was initialised — the
+ *       child inherits non-NULL but dangling VAs (VA-differs: even an
+ *       inherited mapping may live at a different VA);
+ *   S2: the DP maps shm per-vcpu rather than per-process — a VA resolved on
+ *       vcpu0 is unmapped on vcpu1.
+ * Wire the platform's pid / vcpu-id APIs through these macros; ensure_init()
+ * then detects the context switch, drops the stale caches and re-attaches in
+ * the current context (DP threads are core-pinned, so the context cannot
+ * change mid-call). In MEM_MANAGER_USE_API_H builds the defaults bind the
+ * platform's AAA_GetPgId()/AAA_GetVcpuId(); otherwise the check is compiled
+ * out (zero cost). Either macro can still be overridden at compile time. */
+#ifndef MM_POOL_GETPID
+#  ifdef MEM_MANAGER_USE_API_H
+#    define MM_POOL_GETPID()  ((int)AAA_GetPgId())   /* DP: pg id; CP/Linux: -1 */
+#  else
+#    define MM_POOL_GETPID()  0
+#  endif
+#endif
+#ifndef MM_POOL_GETVCPU
+#  ifdef MEM_MANAGER_USE_API_H
+#    define MM_POOL_GETVCPU() ((int)AAA_GetVcpuId()) /* DP: logical core no.    */
+#  else
+#    define MM_POOL_GETVCPU() 0
+#  endif
+#endif
+
+static INT32 g_owner_pid;
+static INT32 g_owner_vcpu;
+
+/* ---------------- diagnostics ---------------- */
+#ifdef IS_CP
+#  define mm_pool_log(...)  do { fprintf(stderr, "mmpool: " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#elif defined(LOG_FILE_INFO)
+#  define mm_pool_log(...)  LOG_FILE_INFO("MMPOOL", __VA_ARGS__)
+#else
+#  define mm_pool_log(...)  ((void)0)
+#endif
+
 /* Process-local VA of each pool block, stored as INT64 (pointer-width) so the
  * platform's 64-bit atomic interfaces apply. Business flags are VA-differs, so
  * the same pool block lives at a DIFFERENT address in every process: each
@@ -143,6 +185,8 @@ static void* local_base(PoolMeta* m, int i) {
     snprintf(nm, sizeof nm, "mmpool/blk-%d-%d", (int)m->blocks[i].flags, i);
     void* p = NULL;
     INT32 r = ShmMap(m->blocks[i].flags, nm, m->block_size, &p);
+    mm_pool_log("block %d attach (%s): pid=%d vcpu=%d ret=%d va=%p", i, nm,
+                (int)MM_POOL_GETPID(), (int)MM_POOL_GETVCPU(), (int)r, p);
     if (r < 0 || !p) return NULL;
     AAA_Atomic64SetRelease(&g_blk_base[i], (INT64)(uintptr_t)p);
     return p;
@@ -249,6 +293,8 @@ void mm_pool_default_cfg(Mm_PoolCfg* cfg) {
 static void meta_attach(const Mm_PoolCfg* cfg) {
     void* p = NULL;
     INT32 ret = ShmMap(MM_META_FLAGS, (char*)MM_META_NAME, (UINT32)sizeof(PoolMeta), &p);
+    mm_pool_log("meta ShmMap: pid=%d vcpu=%d ret=%d va=%p",
+                (int)MM_POOL_GETPID(), (int)MM_POOL_GETVCPU(), (int)ret, p);
     if (ret < 0 || !p) return;          /* no meta -> g_meta stays NULL -> passthrough */
     PoolMeta* m = (PoolMeta*)p;
 
@@ -291,6 +337,8 @@ void mm_pool_init(const Mm_PoolCfg* cfg) {
      * assumption. */
     if (AAA_Atomic32CmpAndStoreAcquire(&g_init_state, 0, 1)) {
         meta_attach(cfg);               /* single in-process creator/attacher */
+        AAA_Atomic32SetRelaxed(&g_owner_pid,  (INT32)MM_POOL_GETPID());
+        AAA_Atomic32SetRelaxed(&g_owner_vcpu, (INT32)MM_POOL_GETVCPU());
         AAA_Atomic32SetRelease(&g_init_state, 2);
         return;
     }
@@ -303,9 +351,27 @@ void mm_pool_init(const Mm_PoolCfg* cfg) {
         if (++spins > MM_READY_SPINS) return;
 }
 
+static void drop_local_state(void) {
+    meta_put(NULL);
+    for (int i = 0; i < MM_MAX_BLOCKS; i++)
+        AAA_Atomic64SetRelease(&g_blk_base[i], 0);
+    AAA_Atomic32SetRelease(&g_init_state, 0);
+}
+
 static void ensure_init(void) {
-    if (AAA_Atomic32ReadAcquire(&g_init_state) != 2)
-        mm_pool_init(NULL);
+    if (AAA_Atomic32ReadAcquire(&g_init_state) == 2) {
+        INT32 pid = (INT32)MM_POOL_GETPID();
+        INT32 vc  = (INT32)MM_POOL_GETVCPU();
+        INT32 opid = AAA_Atomic32ReadAcquire(&g_owner_pid);
+        INT32 ovc  = AAA_Atomic32ReadAcquire(&g_owner_vcpu);
+        if (opid == pid && ovc == vc) return;   /* same context: caches valid */
+        /* fork child / different vcpu: the cached VAs dangle HERE. Drop and
+         * re-attach in this context (contexts are pinned, no mid-call switch). */
+        mm_pool_log("context change (pid %d->%d vcpu %d->%d): re-attaching",
+                    (int)opid, (int)pid, (int)ovc, (int)vc);
+        drop_local_state();
+    }
+    mm_pool_init(NULL);
 }
 
 /* TEST ONLY: forget our attachment so the next init re-runs meta_attach. The
@@ -314,10 +380,7 @@ static void ensure_init(void) {
  * block-VA cache is also dropped, simulating a fresh process that must
  * re-resolve every pool block's VA via local_base(). */
 void mm_pool_reset_for_test(void) {
-    meta_put(NULL);
-    for (int i = 0; i < MM_MAX_BLOCKS; i++)
-        AAA_Atomic64SetRelease(&g_blk_base[i], 0);
-    AAA_Atomic32SetRelease(&g_init_state, 0);
+    drop_local_state();
 }
 
 /* ---------------- cross-process create-path spinlock ---------------- */
