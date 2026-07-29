@@ -84,8 +84,9 @@ Measured reality (corrected 2026-07, supersedes the earlier "~99% VA-same"
 estimate): **the business workload is ~all VA-differs**. Step 2 therefore
 pools VA-differs directly: the shared metadata stores only offsets/indices,
 and each process attaches every pool block by name and resolves addresses
-against its own local VA. Default poolable flags = **{1}** (CP+DP inter-PG
-shared); the same code path also serves VA-same flags if enabled in the mask.
+against its own local VA. Default poolable flags = **{0}** — business type-1
+(CP+DP inter-PG shared), which api.h #defines as `0U`: the mask tests flag
+VALUES, not type numbers.
 
 ## 5. Step 1 — what is built
 
@@ -142,9 +143,10 @@ so the DP backend can stay a dumb raw-event emitter.
 Implemented in `src/pool/mm_pool.{h,c}` (compiled with `-DMEM_MANAGER_POOL=ON`;
 default OFF keeps `Platform_ShmMap` a pure Step-1 passthrough):
 
-- **Scope:** poolable flags default to **{1}** (VA-differs, CP+DP inter-PG
-  shared — the dominant business usage); requests `>= threshold`, flags 3, and
-  any flags outside the mask pass straight through to `ShmMap`.
+- **Scope:** poolable flags default to **{0}** (business type-1 = VA-differs,
+  CP+DP inter-PG shared — the dominant business usage; api.h #defines it as
+  `0U`); requests `>= threshold` and any flags outside the mask pass straight
+  through to `ShmMap`.
 - **VA-differs addressing:** the shared metadata (`mmpool/meta`, flags 1)
   stores only offsets/indices — never pointers. Each process attaches every
   pool block's OS region by name and resolves `address = local_base[block_idx]

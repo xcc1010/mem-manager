@@ -10,7 +10,8 @@
 > **2026-07 数据修正（推翻早期"~99% VA-same"结论）**：实际业务**几乎全是 VA-differs**
 > （flags 0/1/2）。v1 因此**直接池化 VA-differs**：共享元数据只存偏移/索引、不存指针，
 > 各进程按块名自行 attach 池块、用本地 VA + 偏移寻址（同一路径天然兼容 VA-same）。
-> 默认可池化 flags = **{1}**（CP+DP 进程组间共享）。当前代码（`src/pool/mm_pool.c`）
+> 默认可池化 flags = **{0}**（注意：掩码按 flags **值**判断，业务"类型1"
+> 在 api.h 中 `#define` 为 `0U`）。当前代码（`src/pool/mm_pool.c`）
 > 即按此实现并已进入内部项目试用。
 
 ---
@@ -19,7 +20,7 @@
 
 | 请求 | 处理 |
 |---|---|
-| `size < threshold` 且 `flags` 可池化（**默认 {1}** = VA-differs，CP+DP 进程组间共享） | **进池**（bump 切槽） |
+| `size < threshold` 且 `flags` 可池化（**默认仅值 0** = 业务类型1，VA-differs，CP+DP 进程组间共享） | **进池**（bump 切槽） |
 | `size ≥ threshold`（大块） | **透传 OS** |
 | 掩码外的 flags（含 process-shared 3、未启用的 0/2/4/5） | **透传 OS** |
 | `enable=false` | **全透传**（等价 Step 1，一键回滚） |
@@ -153,7 +154,7 @@ typedef struct {
     int    enable;
     UINT32 threshold;                 /* ≥ 此值透传 OS（默认 0x200000=2MB） */
     UINT32 block_size;                /* 池块大小（OS 申请粒度，默认 2MB） */
-    UINT32 poolable_flags_mask;       /* 位掩码：哪些 flags 入池（默认 1<<1） */
+    UINT32 poolable_flags_mask;       /* 位掩码：哪些 flags 值入池（默认 1<<0 = 业务类型1，api.h 定义为 0U） */
     int    nclasses;
     SizeClassCfg classes[MAX_CLASSES];
 } PoolCfg;
@@ -333,7 +334,7 @@ v1 配置项（见 `config/pool.json`）：
   "enable": true,                  // false = 全透传（等价 Step 1，一键回滚）
   "threshold": "0x200000",         // ≥ 此值透传 OS（大块不进池）；数字或 "0x.." 字符串
   "block_size": "0x4000000",     // 池块大小（OS 申请粒度，默认 64MB；须为 2MB 倍数）
-  "poolable_flags": [1]            // 只池化 flags=1（VA-differs，CP+DP 进程组间）
+  "poolable_flags": [0]            // 只池化 flags 值 0（= 业务类型1，api.h 定义为 0U）
 }
 ```
 
@@ -387,7 +388,8 @@ v1 配置项（见 `config/pool.json`）：
 - **【A】CP/DP 都能申请** → **单一共享池** + `TrySpinLock`（拿不到→兜底透传）+ 原子 refcount（§2.5）。否决"每进程 arena"（牺牲打包密度）。
 - **【B】崩溃**：`TrySpinLock`+兜底 → 最坏**降级透传、绝不死锁**；**不依赖锁崩溃健壮**。
 - **NUMA**：部署固定、消费者大多同节点 → 池块放**公共节点**；OnPg 按节点分池；配置静态指定。
-- **范围（2026-07 修正）**：VA-differs（0/1/2）**进池**（默认仅 {1}）；process-shared（3）/大块/掩码外 flags → 透传（§0）。
+- **范围（2026-07 修正）**：VA-differs（类型 0/1/2）**进池**（默认仅类型1 = **flags 值 0**，api.h `#define` 为 `0U`）；process-shared/大块/掩码外 flags → 透传（§0）。
+  注意掩码按 **flags 值**判断，类型编号 ≠ 值。
 - **不同 flags 值分池**（共享范围不同，隔离不能破）。
 - **元数据只存偏移**，各进程本地解析 VA（§2.4）。
 - **attach 无锁**（查表 acquire + 原子 refcount），创建才持锁 → 性能严格友好。

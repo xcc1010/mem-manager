@@ -46,7 +46,8 @@ must **not** share a pool block.
 > **2026-07 correction:** the "~99% VA-same" estimate above was wrong — the
 > real workload is ~all VA-differs (0/1/2). Step 2 v1 therefore pools
 > VA-differs directly (offset-only shared metadata + per-process block
-> attach; default poolable flags = {1}). See DESIGN.md §4/§6.
+> attach; default poolable flags = {0} — business type-1, api.h #defines it as
+> 0U; the mask tests flag VALUES, not type numbers). See DESIGN.md §4/§6.
 
 ## Output
 

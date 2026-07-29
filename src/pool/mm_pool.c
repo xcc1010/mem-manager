@@ -3,8 +3,9 @@
  * v1 scope decisions (see docs/STEP2_DESIGN.zh.md §2.2, §2.5 and the 2026-07
  * scope updates):
  *   - BUMP strategy only (no per-slot reclaim; slab/freelist dropped for v1).
- *   - Poolable flags default = {1}: the business workload is ~all VA-DIFFERS
- *     (flags 0/1/2; flags 1 = CP+DP inter-PG shared). VA-same (4/5) is rare.
+ *   - Poolable flags default = {0}: the business workload is ~all VA-DIFFERS,
+ *     and business type-1 (CP+DP inter-PG shared) is #define'd as 0U in api.h.
+ *     NOTE: the mask tests flag VALUES, not type numbers — type-1 == value 0.
  *   - VA-differs addressing: the shared meta ("mmpool/meta", flags 1) stores
  *     ONLY offsets/indices — never pointers. Each process attaches every pool
  *     block's OS region by name and keeps its own local VA (g_blk_base);
@@ -74,8 +75,8 @@ int snprintf(char* s, size_t n, const char* fmt, ...);
 #define MM_NAME_MAX      64
 #define MM_SLOT_ALIGN    16u
 #define MM_META_NAME     "mmpool/meta"
-#define MM_META_FLAGS    1              /* CP+DP inter-PG shared; meta stores no   */
-                                        /* cross-process pointers, VA may differ   */
+#define MM_META_FLAGS    0              /* business type-1 (CP+DP inter-PG, VA-  */
+                                        /* differs) is #define'd as 0U in api.h  */
 #define MM_META_MAGIC    0x4D4D504F4F4C3033ULL   /* "MMPOOL03" (layout id) */
 #define MM_LOCK_RETRIES  20000      /* one try_lock round (~ms)            */
 #define MM_CREATE_ROUNDS 128        /* rounds of {try lock, re-lookup} before passthrough */
@@ -297,7 +298,7 @@ void mm_pool_default_cfg(Mm_PoolCfg* cfg) {
     cfg->enable              = 1;
     cfg->threshold           = 0x200000u;
     cfg->block_size          = 0x4000000u;          /* 64MB blocks (2026-07 trial value) */
-    cfg->poolable_flags_mask = (1u << 1);           /* v1: flags=1 only (VA-differs, CP+DP inter-PG) */
+    cfg->poolable_flags_mask = (1u << 0);           /* v1: flags VALUE 0 = business type-1 (api.h #define 0U) */
 #ifdef IS_CP
     const char* path = getenv("MEM_POOL_CONFIG");   /* the only env var: where the file is */
     if (path && *path) mm_pool_load_config(path, cfg);   /* file overrides defaults */

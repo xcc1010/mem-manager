@@ -11,8 +11,9 @@
  * pointer-advance carve, O(1), no per-slot reclaim (best fit for the
  * init-once/long-lived profile; slab/freelist were dropped from scope).
  *
- * The business workload is ~all VA-DIFFERS (default poolable flags = {1},
- * CP+DP inter-PG shared). The shared metadata ("mmpool/meta") therefore stores
+ * The business workload is ~all VA-DIFFERS (default poolable flags = {0},
+ * i.e. business type-1: api.h #defines it as 0U — the mask tests flag VALUES,
+ * not type numbers). The shared metadata ("mmpool/meta") therefore stores
  * ONLY offsets/indices — never pointers; each process attaches every pool
  * block's OS region by name and resolves addresses against its own local VA.
  * (The same path also serves VA-same flags if they are enabled in the mask.)
@@ -35,7 +36,7 @@ typedef struct {
     int          enable;              /* 0 -> everything passes through (one-key rollback = Step 1) */
     UINT32       threshold;           /* size >= threshold -> passthrough        (default 0x200000) */
     UINT32       block_size;          /* OS block size carved from              (default 0x4000000) */
-    UINT32       poolable_flags_mask; /* bit f set -> flags==f may pool        (default 1<<1) */
+    UINT32       poolable_flags_mask; /* bit f set -> flags==f may pool        (default 1<<0) */
 } Mm_PoolCfg;
 
 /* Parse a flat JSON config file into cfg (only keys present are overwritten).
@@ -44,7 +45,7 @@ typedef struct {
  * Returns 0 on success, -1 if the file cannot be read. Unknown keys are
  * ignored. Format (see config/pool.json):
  *   { "enable": true, "threshold": "0x200000", "block_size": "0x4000000",
- *     "poolable_flags": [1] }
+ *     "poolable_flags": [0] }   (flags VALUE 0 = business type-1, api.h 0U)
  * Byte sizes accept a JSON number (decimal) or a string ("0x.." hex ok). */
 int mm_pool_load_config(const char* path, Mm_PoolCfg* cfg);
 

@@ -51,7 +51,7 @@ through to the OS unchanged. Configuration (see [config/pool.json](config/pool.j
 
 ```json
 { "enable": true, "threshold": "0x200000", "block_size": "0x4000000",
-  "poolable_flags": [1] }
+  "poolable_flags": [0] }
 ```
 
 - The meta creator reads the JSON file named by `MEM_POOL_CONFIG` (flat object;
