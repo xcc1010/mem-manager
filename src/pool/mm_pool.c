@@ -327,6 +327,16 @@ static void meta_attach(const Mm_PoolCfg* cfg) {
     PoolMeta* m = (PoolMeta*)p;
 
     if (ret == 1) {                     /* we are the creator */
+#ifndef IS_CP
+        /* A PG/DP process should NEVER be the creator: the Simulator (CP) is
+         * required to pre-create the meta (mm_pool_init) before loadPG, so
+         * every PG only ever attaches. Getting ret==1 here means the boot
+         * ordering was violated (or a concurrent-create race produced a
+         * duplicate segment). We still initialise as a safe fallback. */
+        mm_pool_log("WARN: meta created by a PG process (pid=%d vcpu=%d) - "
+                    "Simulator must pre-create it before loadPG",
+                    (int)MM_POOL_GETPID(), (int)MM_POOL_GETVCPU());
+#endif
         memset(m, 0, sizeof *m);        /* OS shm may not be zero-filled; be explicit */
         Mm_PoolCfg c;
         if (cfg) c = *cfg; else mm_pool_default_cfg(&c);

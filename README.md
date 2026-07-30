@@ -59,6 +59,10 @@ through to the OS unchanged. Configuration (see [config/pool.json](config/pool.j
   publishes the resulting config in shared metadata — attaching processes never
   read the file. `MEM_POOL_CONFIG` is the only environment variable used, and
   only to locate the file; there are no per-knob env overrides.
+- **Boot order (required):** the Simulator (CP) must call `mm_pool_init(NULL)`
+  — or make any `Platform_ShmMap` call — during its own init, before `loadPG`
+  of any PG, so `mmpool/meta` is created exactly once and every PG only
+  attaches. A PG that ends up creator anyway logs a WARN (ordering violated).
 - Precedence: built-in defaults < JSON file. Rollback = `"enable": false`.
 
 ## Run

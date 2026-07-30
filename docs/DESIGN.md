@@ -211,6 +211,13 @@ degrades safely to consistent passthrough for new names.
 - Build with `-DMEM_MANAGER_USE_API_H=ON` so `INT32`/`UINT32`, the OS `Shm*` and
   the business `IS_CP` macro come from the internal `api.h`.
 - Enable `MEM_MANAGER_PROFILE` in the platform's Debug build to capture profiles.
+- **Pre-create the pool meta single-point (REQUIRED).** The Simulator (CP)
+  must call `mm_pool_init(NULL)` — or make any `Platform_ShmMap` call —
+  during its own init, **before `loadPG` of any PG**. This creates
+  `mmpool/meta` exactly once; every PG then only attaches (`ret >= 2`). It
+  eliminates the concurrent-create race that produced duplicate meta
+  segments. A PG that still ends up creator (`ret == 1`) logs a WARN — that
+  means the ordering was violated.
 - **No mem-manager CP/DP flag.** mem-manager keys off the business's own `IS_CP`
   macro: when absent (data plane) it drops `Platform_ShmMapOnPg` (a CP-only OS
   symbol — otherwise the DP `.a` fails at link) and selects the log profiler
