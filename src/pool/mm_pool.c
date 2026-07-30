@@ -77,7 +77,8 @@ int snprintf(char* s, size_t n, const char* fmt, ...);
 #define MM_META_NAME     "mmpool/meta"
 #define MM_META_FLAGS    0              /* business type-1 (CP+DP inter-PG, VA-  */
                                         /* differs) is #define'd as 0U in api.h  */
-#define MM_META_MAGIC    0x4D4D504F4F4C3033ULL   /* "MMPOOL03" (layout id) */
+#define MM_META_MAGIC    0x4D4D504F4F4C3034ULL   /* "MMPOOL04" (layout id) */
+#define MM_MAX_BLOCK_SIZE 0x8000000u               /* 128MB = platform OS max segment */
 #define MM_LOCK_RETRIES  20000      /* one try_lock round (~ms)            */
 #define MM_CREATE_ROUNDS 128        /* rounds of {try lock, re-lookup} before passthrough */
 #define MM_READY_SPINS   50000000L  /* bounded wait for the meta ready flag (~0.1-0.5s) */
@@ -142,13 +143,15 @@ static void meta_put(PoolMeta* m) {
  * them:
  *   S1: the platform FORKS processes after the pool was initialised — the
  *       child inherits non-NULL but dangling VAs (VA-differs: even an
- *       inherited mapping may live at a different VA).
- *   (S2 — DP maps shm per-vcpu — was considered and RULED OUT on the
- *    platform: mappings are per-pg; vcpu switches within a pg share them.
- *    The watchdog therefore keys on the pg id only.)
+ *       inherited mapping may live at a different VA);
+ *   S2: shm VA scope is PER-VCPU on this platform (CONFIRMED by A/B test:
+ *       the pgid-only watchdog coredumped on the meta deref, the
+ *       (pgid,vcpu) watchdog does not; a process that attached meta on one
+ *       vcpu faults when another vcpu dereferences the cached VA).
  * Wire the platform's pg/vcpu-id APIs through these macros; ensure_init()
- * then detects the pg change, drops the stale caches and re-attaches in the
- * current context. AAA_GetPgId/AAA_GetVcpuId exist only in the DP link
+ * then detects the context switch, drops the stale caches and re-attaches in
+ * the current context (DP threads are core-pinned, so the context cannot
+ * change mid-call). AAA_GetPgId/AAA_GetVcpuId exist only in the DP link
  * environment, so the defaults bind them on the DP (MEM_MANAGER_USE_API_H
  * without IS_CP) and compile the check out everywhere else (zero cost). On
  * the CP the watchdog is therefore off — single process, no fork observed;
@@ -169,6 +172,7 @@ static void meta_put(PoolMeta* m) {
 #endif
 
 static INT32 g_owner_pid;
+static INT32 g_owner_vcpu;
 
 /* ---------------- diagnostics ---------------- */
 #ifdef IS_CP
@@ -178,6 +182,14 @@ static INT32 g_owner_pid;
 #else
 #  define mm_pool_log(...)  ((void)0)
 #endif
+
+/* Rate-limited per-stage trace (first 64 per stage): the last trace line
+ * before a coredump tells us exactly which stage faulted. */
+#define MM_TRACE(slot, ...) do { \
+    static INT32 tr_[8]; \
+    if ((slot) < 8 && AAA_Atomic32IncReturn(&tr_[(slot)]) <= 64) \
+        mm_pool_log(__VA_ARGS__); \
+} while (0)
 
 /* Process-local VA of each pool block, stored as INT64 (pointer-width) so the
  * platform's 64-bit atomic interfaces apply. Business flags are VA-differs, so
@@ -339,6 +351,18 @@ static void meta_attach(const Mm_PoolCfg* cfg) {
     mm_pool_log("meta cfg: enable=%d threshold=0x%x block_size=0x%x mask=0x%x",
                 (int)m->enable, (unsigned)m->threshold, (unsigned)m->block_size,
                 (unsigned)m->poolable_flags_mask);
+    /* Sanity-check the snapshot before trusting it. A stale meta segment
+     * (old layout, same magic — observed: block_size read as 0, then every
+     * block ShmMap failed with 'size: 0' and a garbage nblocks could walk
+     * blocks[] out of the segment) would otherwise be used blindly. Treat
+     * corruption as "no meta" -> clean passthrough instead of coredump. */
+    if ((m->enable != 0 && m->enable != 1) ||
+        m->threshold == 0 || m->block_size == 0 ||
+        m->block_size > MM_MAX_BLOCK_SIZE || (m->block_size & 0x1FFFFFu) != 0) {
+        mm_pool_log("corrupt meta cfg -> passthrough (stale segment? mixed"
+                    " CP/DP builds? destroy mmpool/meta and restart)");
+        return;
+    }
     meta_put(m);                        /* atomic release publication (see g_meta_va) */
 }
 
@@ -355,7 +379,8 @@ void mm_pool_init(const Mm_PoolCfg* cfg) {
      * assumption. */
     if (AAA_Atomic32CmpAndStoreAcquire(&g_init_state, 0, 1)) {
         meta_attach(cfg);               /* single in-process creator/attacher */
-        AAA_Atomic32SetRelaxed(&g_owner_pid, (INT32)MM_POOL_GETPID());
+        AAA_Atomic32SetRelaxed(&g_owner_pid,  (INT32)MM_POOL_GETPID());
+        AAA_Atomic32SetRelaxed(&g_owner_vcpu, (INT32)MM_POOL_GETVCPU());
         AAA_Atomic32SetRelease(&g_init_state, 2);
         return;
     }
@@ -377,14 +402,16 @@ static void drop_local_state(void) {
 
 static void ensure_init(void) {
     if (AAA_Atomic32ReadAcquire(&g_init_state) == 2) {
-        INT32 pid  = (INT32)MM_POOL_GETPID();
+        INT32 pid = (INT32)MM_POOL_GETPID();
+        INT32 vc  = (INT32)MM_POOL_GETVCPU();
         INT32 opid = AAA_Atomic32ReadAcquire(&g_owner_pid);
-        if (opid == pid) return;                    /* same pg: caches valid */
-        /* forked into a different pg: the cached VAs dangle HERE. Drop and
-         * re-attach in this context. (Confirmed on the platform: mappings
-         * are per-pg, vcpu switches within a pg share them — no re-attach.) */
-        mm_pool_log("pg change (pgid %d->%d, vcpu %d): re-attaching",
-                    (int)opid, (int)pid, (int)MM_POOL_GETVCPU());
+        INT32 ovc  = AAA_Atomic32ReadAcquire(&g_owner_vcpu);
+        if (opid == pid && ovc == vc) return;   /* same context: caches valid */
+        /* fork child / different vcpu: the cached VAs dangle HERE (VA scope
+         * is per-vcpu on this platform — CONFIRMED). Drop and re-attach in
+         * this context (contexts are pinned, no mid-call switch). */
+        mm_pool_log("context change (pg %d->%d vcpu %d->%d): re-attaching",
+                    (int)opid, (int)pid, (int)ovc, (int)vc);
         drop_local_state();
     }
     mm_pool_init(NULL);
@@ -461,11 +488,19 @@ static NameEntry* reserve(PoolMeta* m, const char* name, int blk, UINT32 off,
 
 /* ---------------- bump carve (holds the lock) ---------------- */
 
+/* Read nblocks with a defensive clamp: a corrupt meta must never drive
+ * blocks[]/g_blk_base[] indexing out of bounds. */
+static INT32 nblocks_read(PoolMeta* m) {
+    INT32 n = AAA_Atomic32ReadAcquire(&m->nblocks);
+    if (n < 0) return 0;
+    return n > MM_MAX_BLOCKS ? MM_MAX_BLOCKS : n;
+}
+
 static UINT32 align_up(UINT32 v, UINT32 a) { return (v + (a - 1)) & ~(a - 1); }
 
 static int carve_bump(PoolMeta* m, UINT32 size, INT32 flags, int* blk_out, UINT32* off_out) {
     UINT32 need = align_up(size, MM_SLOT_ALIGN);
-    INT32 n = AAA_Atomic32ReadAcquire(&m->nblocks);
+    INT32 n = nblocks_read(m);
     for (int i = 0; i < n; i++) {
         PoolBlock* b = &m->blocks[i];
         if (b->flags != flags) continue;
@@ -511,6 +546,10 @@ static int entry_ok(const NameEntry* e, INT32 flags, UINT32 size) {
 }
 
 static int attach(PoolMeta* m, NameEntry* e, void** out, INT32* ret) {
+    if (e->block_idx < 0 || e->block_idx >= MM_MAX_BLOCKS) {  /* corrupt entry */
+        *out = NULL; *ret = -1;
+        return -1;
+    }
     void* base = local_base(m, e->block_idx);
     if (!base) {                    /* OS attach failed: visible error, never split */
         *out = NULL; *ret = -1;
@@ -542,11 +581,13 @@ int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret
     if (name_len(name, MM_NAME_MAX) >= MM_NAME_MAX)
                                { MM_REJECT_LOG("name too long"); return 0; }
     if (!poolable(m, flags, size)) { MM_REJECT_LOG("not poolable"); return 0; }
+    MM_TRACE(0, "try_map: name=%s flags=%d size=0x%x", name, (int)flags, (unsigned)size);
 
     /* attach hot path: lock-free lookup + atomic refcount */
     NameEntry* e = lookup(m, name);
     if (e) {
         if (!entry_ok(e, flags, size)) goto conflict;
+        MM_TRACE(1, "attach: name=%s blk=%d off=0x%x", name, (int)e->block_idx, (unsigned)e->off);
         return attach(m, e, out, ret);
     }
 
@@ -559,10 +600,15 @@ int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret
      * everyone else fails identically, so the name is consistently OS-shared). */
     for (int round = 0; round < MM_CREATE_ROUNDS; round++) {
         if (try_lock(m)) {
+            MM_TRACE(2, "create lock: name=%s round=%d", name, round);
             e = lookup(m, name);                    /* double-check under lock */
             if (!e) {
                 int blk; UINT32 off;
-                if (!carve_bump(m, size, flags, &blk, &off)) { unlock(m); return 0; }
+                if (!carve_bump(m, size, flags, &blk, &off)) {
+                    unlock(m);
+                    MM_REJECT_LOG("carve failed (pool full)");
+                    return 0;
+                }
                 void* base = local_base(m, blk);    /* cached for a fresh block */
                 if (!base)                                 { unlock(m); return 0; }
                 e = reserve(m, name, blk, off, size, flags);
@@ -570,6 +616,8 @@ int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret
                 AAA_Atomic32SetRelaxed(&e->refcount, 1);
                 AAA_Atomic32SetRelease(&e->state, ST_USED);  /* publish */
                 unlock(m);
+                MM_TRACE(3, "created: name=%s blk=%d off=0x%x va=%p",
+                         name, blk, (unsigned)off, (char*)base + off);
                 *out = (char*)base + off;
                 *ret = 1;                           /* creator: exactly 1 */
                 return 1;
@@ -588,7 +636,13 @@ int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret
             return attach(m, e, out, ret);
         }
     }
-    return 0;   /* lock frozen / budget exhausted -> consistent OS passthrough */
+    /* Budget exhausted with the entry still missing: either the create lock
+     * is FROZEN (a holder crashed — the lock lives in the persistent meta
+     * segment and stays set across restarts -> pool silently frozen), or the
+     * pool/name table is full. Both degrade to a consistent OS passthrough;
+     * log so the freeze is visible instead of silent. */
+    MM_REJECT_LOG("create exhausted (lock frozen? pool/table full?)");
+    return 0;
 
 conflict:
     *out = NULL;
@@ -600,12 +654,14 @@ int mm_pool_try_unmap(void* addr, INT32* ret) {
     ensure_init();
     PoolMeta* m = meta_get();      /* opaque atomic load (see mm_pool_try_map) */
     if (!m || !addr) return 0;
-    INT32 n = AAA_Atomic32ReadAcquire(&m->nblocks);
+    MM_TRACE(4, "try_unmap: addr=%p", addr);
+    INT32 n = nblocks_read(m);
     for (int i = 0; i < n; i++) {
         char* lo = (char*)(uintptr_t)AAA_Atomic64ReadAcquire(&g_blk_base[i]);
         if (lo && (char*)addr >= lo && (char*)addr < lo + m->blocks[i].size) {
             /* BUMP: no per-slot reclaim; just claim it so the caller doesn't
              * OS-unmap a sub-slot. Full refcount lifecycle lands with slab/freelist. */
+            MM_TRACE(5, "unmap claimed: addr=%p blk=%d", addr, i);
             if (ret) *ret = 0;
             return 1;
         }
