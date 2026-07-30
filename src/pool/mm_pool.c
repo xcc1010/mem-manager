@@ -142,13 +142,13 @@ static void meta_put(PoolMeta* m) {
  * them:
  *   S1: the platform FORKS processes after the pool was initialised — the
  *       child inherits non-NULL but dangling VAs (VA-differs: even an
- *       inherited mapping may live at a different VA);
- *   S2: the DP maps shm per-vcpu rather than per-process — a VA resolved on
- *       vcpu0 is unmapped on vcpu1.
- * Wire the platform's pid / vcpu-id APIs through these macros; ensure_init()
- * then detects the context switch, drops the stale caches and re-attaches in
- * the current context (DP threads are core-pinned, so the context cannot
- * change mid-call). AAA_GetPgId/AAA_GetVcpuId exist only in the DP link
+ *       inherited mapping may live at a different VA).
+ *   (S2 — DP maps shm per-vcpu — was considered and RULED OUT on the
+ *    platform: mappings are per-pg; vcpu switches within a pg share them.
+ *    The watchdog therefore keys on the pg id only.)
+ * Wire the platform's pg/vcpu-id APIs through these macros; ensure_init()
+ * then detects the pg change, drops the stale caches and re-attaches in the
+ * current context. AAA_GetPgId/AAA_GetVcpuId exist only in the DP link
  * environment, so the defaults bind them on the DP (MEM_MANAGER_USE_API_H
  * without IS_CP) and compile the check out everywhere else (zero cost). On
  * the CP the watchdog is therefore off — single process, no fork observed;
@@ -169,7 +169,6 @@ static void meta_put(PoolMeta* m) {
 #endif
 
 static INT32 g_owner_pid;
-static INT32 g_owner_vcpu;
 
 /* ---------------- diagnostics ---------------- */
 #ifdef IS_CP
@@ -337,6 +336,9 @@ static void meta_attach(const Mm_PoolCfg* cfg) {
             if (++spins > MM_READY_SPINS) return;   /* creator died mid-init -> passthrough */
         }
     }
+    mm_pool_log("meta cfg: enable=%d threshold=0x%x block_size=0x%x mask=0x%x",
+                (int)m->enable, (unsigned)m->threshold, (unsigned)m->block_size,
+                (unsigned)m->poolable_flags_mask);
     meta_put(m);                        /* atomic release publication (see g_meta_va) */
 }
 
@@ -353,8 +355,7 @@ void mm_pool_init(const Mm_PoolCfg* cfg) {
      * assumption. */
     if (AAA_Atomic32CmpAndStoreAcquire(&g_init_state, 0, 1)) {
         meta_attach(cfg);               /* single in-process creator/attacher */
-        AAA_Atomic32SetRelaxed(&g_owner_pid,  (INT32)MM_POOL_GETPID());
-        AAA_Atomic32SetRelaxed(&g_owner_vcpu, (INT32)MM_POOL_GETVCPU());
+        AAA_Atomic32SetRelaxed(&g_owner_pid, (INT32)MM_POOL_GETPID());
         AAA_Atomic32SetRelease(&g_init_state, 2);
         return;
     }
@@ -376,15 +377,14 @@ static void drop_local_state(void) {
 
 static void ensure_init(void) {
     if (AAA_Atomic32ReadAcquire(&g_init_state) == 2) {
-        INT32 pid = (INT32)MM_POOL_GETPID();
-        INT32 vc  = (INT32)MM_POOL_GETVCPU();
+        INT32 pid  = (INT32)MM_POOL_GETPID();
         INT32 opid = AAA_Atomic32ReadAcquire(&g_owner_pid);
-        INT32 ovc  = AAA_Atomic32ReadAcquire(&g_owner_vcpu);
-        if (opid == pid && ovc == vc) return;   /* same context: caches valid */
-        /* fork child / different vcpu: the cached VAs dangle HERE. Drop and
-         * re-attach in this context (contexts are pinned, no mid-call switch). */
-        mm_pool_log("context change (pid %d->%d vcpu %d->%d): re-attaching",
-                    (int)opid, (int)pid, (int)ovc, (int)vc);
+        if (opid == pid) return;                    /* same pg: caches valid */
+        /* forked into a different pg: the cached VAs dangle HERE. Drop and
+         * re-attach in this context. (Confirmed on the platform: mappings
+         * are per-pg, vcpu switches within a pg share them — no re-attach.) */
+        mm_pool_log("pg change (pgid %d->%d, vcpu %d): re-attaching",
+                    (int)opid, (int)pid, (int)MM_POOL_GETVCPU());
         drop_local_state();
     }
     mm_pool_init(NULL);
@@ -525,11 +525,23 @@ int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret
     ensure_init();
     PoolMeta* m = meta_get();      /* opaque atomic load: the NULL guard below
                                       cannot be reordered/speculated away     */
-    if (!m)                                  return 0;
-    if (!m->enable)                          return 0;
-    if (!out || !name)                       return 0;
-    if (name_len(name, MM_NAME_MAX) >= MM_NAME_MAX) return 0;
-    if (!poolable(m, flags, size))           return 0;   /* passthrough (incl. big attach) */
+    /* rate-limited rejection diagnostics: why requests pass through */
+    #define MM_REJECT_LOG(reason) do { \
+        static INT32 nrej; \
+        if (AAA_Atomic32IncReturn(&nrej) <= 32) \
+            mm_pool_log("passthrough [%s]: name=%s flags=%d size=0x%x " \
+                        "(enable=%d thr=0x%x blk=0x%x mask=0x%x)", reason, \
+                        name ? name : "(null)", (int)flags, (unsigned)size, \
+                        m ? (int)m->enable : -1, m ? (unsigned)m->threshold : 0, \
+                        m ? (unsigned)m->block_size : 0, \
+                        m ? (unsigned)m->poolable_flags_mask : 0); \
+    } while (0)
+    if (!m)                    { MM_REJECT_LOG("no meta");       return 0; }
+    if (!m->enable)            { MM_REJECT_LOG("disabled");      return 0; }
+    if (!out || !name)         { MM_REJECT_LOG("bad args");      return 0; }
+    if (name_len(name, MM_NAME_MAX) >= MM_NAME_MAX)
+                               { MM_REJECT_LOG("name too long"); return 0; }
+    if (!poolable(m, flags, size)) { MM_REJECT_LOG("not poolable"); return 0; }
 
     /* attach hot path: lock-free lookup + atomic refcount */
     NameEntry* e = lookup(m, name);
