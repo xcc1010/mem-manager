@@ -63,6 +63,10 @@ through to the OS unchanged. Configuration (see [config/pool.json](config/pool.j
   — or make any `Platform_ShmMap` call — during its own init, before `loadPG`
   of any PG, so `mmpool/meta` is created exactly once and every PG only
   attaches. A PG that ends up creator anyway logs a WARN (ordering violated).
+- **Teardown (required):** every process calls `mm_pool_uninit()` at exit,
+  which detaches its meta/block mappings — a full system stop then reclaims
+  the segments, so the next boot starts from a fresh registry (the
+  "ret==1 ⇒ creator initialises" protocol keeps working).
 - Precedence: built-in defaults < JSON file. Rollback = `"enable": false`.
 
 ## Run

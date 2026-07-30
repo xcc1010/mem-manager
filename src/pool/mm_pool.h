@@ -58,8 +58,25 @@ void mm_pool_default_cfg(Mm_PoolCfg* cfg);
 /* Initialise the pool from cfg (thread-safe init-once; pass NULL to use
  * mm_pool_default_cfg). A CAS gate serialises concurrent callers: exactly one
  * thread per process attaches/creates the shared meta, the rest wait for it.
- * Called lazily by the try_* entry points if not called explicitly. */
+ *
+ * LIFECYCLE (required by the platform): call this EXPLICITLY once per process
+ * at startup — the Simulator before loadPG of any PG, and every PG at its
+ * entry point. Pair it with mm_pool_uninit() at process exit. (The lazy path
+ * in try_map/try_unmap remains as a safety net.) */
 void mm_pool_init(const Mm_PoolCfg* cfg);
+
+/* Tear down this process's pool state: ShmUnmap every pool block this process
+ * attached and the meta itself, then drop the local caches. Call once at
+ * process exit (after all pool usage in this process has stopped).
+ *
+ * This is what gives pool segments a proper lifecycle: every attach
+ * (meta/block) increments the OS refcount and nothing used to decrement it,
+ * so segments — and the name registry inside meta — lived forever, breaking
+ * the "ret==1 => I am the creator => I initialise" protocol on the next boot
+ * and preserving stale locks/config across restarts. With every process
+ * calling uninit at exit, a full system stop drops refcounts to zero, the OS
+ * reclaims the segments, and the next boot starts from a fresh registry. */
+void mm_pool_uninit(void);
 
 /* Try to satisfy a map from the pool. Returns:
  *   1  handled: *out and *ret set, *ret = OS-style success = the reference count;

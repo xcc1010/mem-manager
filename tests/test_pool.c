@@ -172,6 +172,24 @@ static void test_concurrent_init(void) {
     printf("concurrent init: ok (%d threads raced mm_pool_init)\n", NT);
 }
 
+/* ---- lifecycle: uninit fully detaches; the next init starts FRESH ----
+ * Must run FIRST: single process, so uninit drops the stub refcounts to zero
+ * and the segments are really destroyed. The business "ret==1 => creator
+ * initialises" protocol must survive a full detach + re-init. */
+static void test_lifecycle(const Mm_PoolCfg* cfg) {
+    void* a = NULL;
+    INT32 r = Platform_ShmMap(1, "life/a", 256, &a);   /* creator: ret == 1 */
+    assert(r == 1 && a);
+
+    mm_pool_uninit();                                   /* detach meta + blocks */
+    mm_pool_init(cfg);                                  /* fresh meta */
+
+    void* b = NULL;
+    r = Platform_ShmMap(1, "life/a", 256, &b);
+    assert(r == 1 && b);    /* fresh registry -> we are the creator AGAIN (ret==1) */
+    printf("lifecycle: ok\n");
+}
+
 int main(void) {
     Mm_PoolCfg cfg;
     mm_pool_default_cfg(&cfg);
@@ -181,6 +199,7 @@ int main(void) {
     cfg.poolable_flags_mask = (1u << 1) | (1u << 2);
     mm_pool_init(&cfg);           /* explicit init: creator's config wins */
 
+    test_lifecycle(&cfg);
     test_functional();
     test_concurrency();
     test_cross_process_attach();

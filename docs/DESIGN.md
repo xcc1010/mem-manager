@@ -218,6 +218,13 @@ degrades safely to consistent passthrough for new names.
   eliminates the concurrent-create race that produced duplicate meta
   segments. A PG that still ends up creator (`ret == 1`) logs a WARN — that
   means the ordering was violated.
+- **Pair every process exit with `mm_pool_uninit()` (REQUIRED).** Each
+  process — Simulator and every PG — calls it during teardown (after all
+  pool usage has stopped). This detaches its meta/block mappings, so a full
+  system stop drops the OS refcounts to zero and the segments are reclaimed:
+  the next boot starts from a fresh registry and the "ret==1 ⇒ creator
+  initialises" protocol keeps working. Without it the segments (and the
+  registry) live forever.
 - **No mem-manager CP/DP flag.** mem-manager keys off the business's own `IS_CP`
   macro: when absent (data plane) it drops `Platform_ShmMapOnPg` (a CP-only OS
   symbol — otherwise the DP `.a` fails at link) and selects the log profiler

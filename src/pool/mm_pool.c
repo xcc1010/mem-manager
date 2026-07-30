@@ -137,6 +137,10 @@ static void meta_put(PoolMeta* m) {
     AAA_Atomic64SetRelease(&g_meta_va, (INT64)(uintptr_t)m);
 }
 
+/* Read nblocks with a defensive clamp: a corrupt meta must never drive
+ * blocks[]/g_blk_base[] indexing out of bounds. */
+static INT32 nblocks_read(PoolMeta* m);
+
 /* ---------------- execution-context identity (fork / per-vcpu guard) ----------------
  * The process-local caches (g_meta_va, g_blk_base) are only valid in the
  * execution context that created them. Two platform realities can invalidate
@@ -408,6 +412,25 @@ static void drop_local_state(void) {
     for (int i = 0; i < MM_MAX_BLOCKS; i++)
         AAA_Atomic64SetRelease(&g_blk_base[i], 0);
     AAA_Atomic32SetRelease(&g_init_state, 0);
+}
+
+void mm_pool_uninit(void) {
+    if (AAA_Atomic32ReadAcquire(&g_init_state) != 2) return;   /* never init'd */
+    PoolMeta* m = meta_get();
+    /* Detach our block mappings first (raw ShmUnmap — NOT the pooled wrapper,
+     * which would claim these addresses). nblocks is read from the live meta
+     * only to bound the scan; the cache itself is the source of truth. */
+    if (m) {
+        INT32 n = nblocks_read(m);
+        for (int i = 0; i < n; i++) {
+            void* p = (void*)(uintptr_t)AAA_Atomic64ReadAcquire(&g_blk_base[i]);
+            if (p) ShmUnmap(p);
+        }
+        mm_pool_log("uninit: pid=%d vcpu=%d detached meta + %d blocks",
+                    (int)MM_POOL_GETPID(), (int)MM_POOL_GETVCPU(), (int)n);
+        ShmUnmap(m);
+    }
+    drop_local_state();
 }
 
 static void ensure_init(void) {
