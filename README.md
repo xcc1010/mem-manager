@@ -59,10 +59,14 @@ through to the OS unchanged. Configuration (see [config/pool.json](config/pool.j
   publishes the resulting config in shared metadata — attaching processes never
   read the file. `MEM_POOL_CONFIG` is the only environment variable used, and
   only to locate the file; there are no per-knob env overrides.
-- **Boot order (required):** the Simulator (CP) must call `mm_pool_init(NULL)`
-  — or make any `Platform_ShmMap` call — during its own init, before `loadPG`
-  of any PG, so `mmpool/meta` is created exactly once and every PG only
-  attaches. A PG that ends up creator anyway logs a WARN (ordering violated).
+- **Boot order (required):** the Simulator (CP) must, during its own init and
+  before `loadPG` of any PG: (1) call `mm_pool_cleanup()` to delete leftover
+  `mmpool/*` segments from previous runs (backstop for crashed processes and
+  refcount churn; needs the platform's delete-by-name interface wired via
+  `MM_POOL_SHM_DELETE`), then (2) call `mm_pool_init(NULL)` — or make any
+  `Platform_ShmMap` call — so `mmpool/meta` is created exactly once and every
+  PG only attaches. A PG that ends up creator anyway logs a WARN (ordering
+  violated).
 - **Teardown (required):** every process calls `mm_pool_uninit()` at exit,
   which detaches its meta/block mappings — a full system stop then reclaims
   the segments, so the next boot starts from a fresh registry (the

@@ -78,6 +78,17 @@ void mm_pool_init(const Mm_PoolCfg* cfg);
  * reclaims the segments, and the next boot starts from a fresh registry. */
 void mm_pool_uninit(void);
 
+/* Boot-time cleanup (backstop): delete any LEFTOVER pool segments (meta +
+ * blocks) from previous runs BY NAME — crashed processes and multi-vcpu
+ * attach churn make refcount-based teardown unreliable, so do not depend on
+ * it. The Simulator calls this BEFORE mm_pool_init() and before loadPG of
+ * any PG (i.e. while no pool user exists yet).
+ *
+ * Requires the platform's delete-by-name interface wired through
+ * MM_POOL_SHM_DELETE(name) — expected to return 0 on success and nonzero if
+ * the name does not exist (used for early exit). Without it this is a no-op. */
+void mm_pool_cleanup(void);
+
 /* Try to satisfy a map from the pool. Returns:
  *   1  handled: *out and *ret set, *ret = OS-style success = the reference count;
  *   0  not handled: caller must fall back to the OS (disabled / not poolable /

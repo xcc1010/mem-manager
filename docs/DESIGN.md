@@ -211,13 +211,17 @@ degrades safely to consistent passthrough for new names.
 - Build with `-DMEM_MANAGER_USE_API_H=ON` so `INT32`/`UINT32`, the OS `Shm*` and
   the business `IS_CP` macro come from the internal `api.h`.
 - Enable `MEM_MANAGER_PROFILE` in the platform's Debug build to capture profiles.
-- **Pre-create the pool meta single-point (REQUIRED).** The Simulator (CP)
-  must call `mm_pool_init(NULL)` — or make any `Platform_ShmMap` call —
-  during its own init, **before `loadPG` of any PG**. This creates
-  `mmpool/meta` exactly once; every PG then only attaches (`ret >= 2`). It
-  eliminates the concurrent-create race that produced duplicate meta
-  segments. A PG that still ends up creator (`ret == 1`) logs a WARN — that
-  means the ordering was violated.
+- **Boot-time cleanup + single-point creation (REQUIRED).** During its own
+  init, before `loadPG` of any PG, the Simulator (CP) must:
+  1. `mm_pool_cleanup()` — delete leftover `mmpool/meta` and `mmpool/blk-*`
+     segments from previous runs BY NAME. This is the backstop for everything
+     refcount-based teardown cannot cover (crashed processes, multi-vcpu
+     attach churn). It needs the platform's delete-by-name interface wired
+     via the `MM_POOL_SHM_DELETE(name)` macro (no-op until wired).
+  2. `mm_pool_init(NULL)` — or any `Platform_ShmMap` call — creating
+     `mmpool/meta` exactly once; every PG then only attaches (`ret >= 2`).
+     A PG that still ends up creator (`ret == 1`) logs a WARN (ordering
+     violated).
 - **Pair every process exit with `mm_pool_uninit()` (REQUIRED).** Each
   process — Simulator and every PG — calls it during teardown (after all
   pool usage has stopped). This detaches its meta/block mappings, so a full

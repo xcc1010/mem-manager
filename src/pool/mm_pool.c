@@ -182,7 +182,8 @@ static INT32 g_owner_vcpu;
 #ifdef IS_CP
 #  define mm_pool_log(...)  do { fprintf(stderr, "mmpool: " __VA_ARGS__); fputc('\n', stderr); } while (0)
 #elif defined(LOG_FILE_INFO)
-#  define mm_pool_log(...)  LOG_FILE_INFO("MMPOOL", __VA_ARGS__)
+   /* LOG_FILE_INFO does not append a newline itself — add one to the fmt */
+#  define mm_pool_log(fmt, ...)  LOG_FILE_INFO("MMPOOL", fmt "\n", __VA_ARGS__)
 #else
 #  define mm_pool_log(...)  ((void)0)
 #endif
@@ -431,6 +432,30 @@ void mm_pool_uninit(void) {
         ShmUnmap(m);
     }
     drop_local_state();
+}
+
+/* ---------------- boot-time cleanup (backstop) ---------------- */
+/* Wire the platform's delete-by-name interface here. Expected contract:
+ * returns 0 on success, nonzero when the name does not exist. */
+#ifndef MM_POOL_SHM_DELETE
+#  define MM_POOL_SHM_DELETE(name) (0)
+#endif
+
+void mm_pool_cleanup(void) {
+    (void)MM_POOL_SHM_DELETE(MM_META_NAME);
+    mm_pool_log("cleanup: deleting stale pool segments (meta + blocks)");
+    /* Block names are mmpool/blk-<flags>-<n>; flags values from ANY era may
+     * exist (e.g. the old default mask), so scan all 32 with an early exit
+     * after 16 consecutive misses. */
+    for (INT32 f = 0; f < 32; f++) {
+        int misses = 0;
+        for (int n = 0; n < MM_MAX_BLOCKS && misses < 16; n++) {
+            char nm[MM_NAME_MAX];
+            snprintf(nm, sizeof nm, "mmpool/blk-%d-%d", (int)f, n);
+            if (MM_POOL_SHM_DELETE(nm)) misses++;   /* not found */
+            else                            misses = 0;
+        }
+    }
 }
 
 static void ensure_init(void) {
