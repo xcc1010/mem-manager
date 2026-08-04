@@ -190,6 +190,24 @@ static void test_lifecycle(const Mm_PoolCfg* cfg) {
     printf("lifecycle: ok\n");
 }
 
+/* ---- cleanup: drain-delete stale segments; next boot sees a fresh registry ----
+ * Simulates "previous run died WITHOUT uninit (refcounts stay >0), then the
+ * Simulator's boot cleanup drains everything". */
+static void test_cleanup(const Mm_PoolCfg* cfg) {
+    void* a = NULL;
+    INT32 r = Platform_ShmMap(1, "clean/a", 128, &a);   /* create pooled entry */
+    assert(r == 1 && a);
+
+    mm_pool_cleanup();          /* drains meta + recorded blocks (stub: frees) */
+    mm_pool_reset_for_test();   /* simulate brand-new processes starting up   */
+    mm_pool_init(cfg);          /* fresh meta */
+
+    void* b = NULL;
+    r = Platform_ShmMap(1, "clean/a", 128, &b);
+    assert(r == 1 && b);        /* fresh registry -> creator again (ret == 1) */
+    printf("cleanup: ok\n");
+}
+
 int main(void) {
     Mm_PoolCfg cfg;
     mm_pool_default_cfg(&cfg);
@@ -206,6 +224,7 @@ int main(void) {
     test_concurrent_init();
     test_json_config();
     test_conflict();
+    test_cleanup(&cfg);
 
     printf("pool v1 (bump, shared-meta, lock-free attach) tests passed\n");
     return 0;

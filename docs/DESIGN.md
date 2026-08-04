@@ -213,11 +213,11 @@ degrades safely to consistent passthrough for new names.
 - Enable `MEM_MANAGER_PROFILE` in the platform's Debug build to capture profiles.
 - **Boot-time cleanup + single-point creation (REQUIRED).** During its own
   init, before `loadPG` of any PG, the Simulator (CP) must:
-  1. `mm_pool_cleanup()` — delete leftover `mmpool/meta` and `mmpool/blk-*`
-     segments from previous runs BY NAME. This is the backstop for everything
-     refcount-based teardown cannot cover (crashed processes, multi-vcpu
-     attach churn). It needs the platform's delete-by-name interface wired
-     via the `MM_POOL_SHM_DELETE(name)` macro (no-op until wired).
+  1. `mm_pool_cleanup()` — drain leftover `mmpool/meta` and `mmpool/blk-*`
+     segments from previous runs. Works with only `ShmMap`/`ShmUnmap`
+     (attach to learn the refcount, then unmap that many times) — no
+     delete-by-name API needed. Backstop for everything refcount-based
+     teardown cannot cover (crashed processes, multi-vcpu attach churn).
   2. `mm_pool_init(NULL)` — or any `Platform_ShmMap` call — creating
      `mmpool/meta` exactly once; every PG then only attaches (`ret >= 2`).
      A PG that still ends up creator (`ret == 1`) logs a WARN (ordering

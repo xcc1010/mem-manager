@@ -435,26 +435,39 @@ void mm_pool_uninit(void) {
 }
 
 /* ---------------- boot-time cleanup (backstop) ---------------- */
-/* Wire the platform's delete-by-name interface here. Expected contract:
- * returns 0 on success, nonzero when the name does not exist. */
-#ifndef MM_POOL_SHM_DELETE
-#  define MM_POOL_SHM_DELETE(name) (0)
-#endif
+/* Drain one named segment: attach (learning the refcount), then unmap that
+ * many times. If the name does not exist the attach creates and immediately
+ * destroys it — a net no-op. */
+static void shm_drain(INT32 flags, const char* name, UINT32 size) {
+    void* p = NULL;
+    INT32 r = ShmMap(flags, (char*)name, size, &p);
+    if (r <= 0 || !p) return;
+    mm_pool_log("cleanup: drain %s (refcount %d)", name, (int)r);
+    for (INT32 i = 0; i < r; i++)
+        if (ShmUnmap(p) != 0) break;
+}
 
 void mm_pool_cleanup(void) {
-    (void)MM_POOL_SHM_DELETE(MM_META_NAME);
-    mm_pool_log("cleanup: deleting stale pool segments (meta + blocks)");
-    /* Block names are mmpool/blk-<flags>-<n>; flags values from ANY era may
-     * exist (e.g. the old default mask), so scan all 32 with an early exit
-     * after 16 consecutive misses. */
-    for (INT32 f = 0; f < 32; f++) {
-        int misses = 0;
-        for (int n = 0; n < MM_MAX_BLOCKS && misses < 16; n++) {
-            char nm[MM_NAME_MAX];
-            snprintf(nm, sizeof nm, "mmpool/blk-%d-%d", (int)f, n);
-            if (MM_POOL_SHM_DELETE(nm)) misses++;   /* not found */
-            else                            misses = 0;
+    /* Attach the leftover meta. If it carries OUR layout magic, its block
+     * table is trustworthy — drain exactly the recorded blocks first. */
+    void* mp = NULL;
+    INT32 r = ShmMap(MM_META_FLAGS, (char*)MM_META_NAME,
+                     (UINT32)sizeof(PoolMeta), &mp);
+    if (r > 1 && mp) {                          /* meta existed before us */
+        PoolMeta* m = (PoolMeta*)mp;
+        if (AAA_Atomic64ReadAcquire((INT64*)&m->ready) == (INT64)MM_META_MAGIC) {
+            INT32 n = nblocks_read(m);
+            for (int i = 0; i < n; i++) {
+                char nm[MM_NAME_MAX];
+                snprintf(nm, sizeof nm, "mmpool/blk-%d-%d", (int)m->blocks[i].flags, i);
+                shm_drain(m->blocks[i].flags, nm, m->block_size);
+            }
         }
+    }
+    if (r > 0) {                                /* drain the meta itself */
+        mm_pool_log("cleanup: drain %s (refcount %d)", MM_META_NAME, (int)r);
+        for (INT32 i = 0; i < r; i++)
+            if (ShmUnmap(mp) != 0) break;
     }
 }
 
