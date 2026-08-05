@@ -186,9 +186,14 @@ default OFF keeps `Platform_ShmMap` a pure Step-1 passthrough):
   the precondition that it only takes effect when the meta region is
   (re)created, i.e. after all processes have detached from it.
 
-Deferred (not in v1): per-slot reclaim (needs slab/freelist), OnPg/per-NUMA
-pools (`Platform_ShmMapOnPg` still passes through), pooled-unmap refcounting
-(profilers report pooled regions as never-freed), passthrough-name markers.
+Deferred (not in v1): per-slot reclaim (needs slab/freelist), pooled-unmap
+refcounting (profilers report pooled regions as never-freed),
+passthrough-name markers, per-vcpu cache layout (the watchdog re-attaches on
+every context switch). OnPg IS pooled since MMPOOL05: blocks are segregated
+per (flags, pgname) and created via ShmMapOnPg on the CP; any process
+attaches the slot by name with plain ShmMap — a name is ONE slot regardless
+of the API (mixed OnPg/plain usage warns on NUMA locality mismatch but never
+splits).
 Accepted trade-off: the OS `ShmMap` for a new pool block runs inside the
 create lock (taking it out would need a CREATING-state machine to avoid
 duplicate name registration); a holder crashing there freezes the pool, which

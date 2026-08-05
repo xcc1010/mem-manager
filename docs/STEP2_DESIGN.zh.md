@@ -410,5 +410,6 @@ v1 配置项（见 `config/pool.json`）：
 2. **bump 分配 + 名字注册表 + 引用计数**（已完成；v1 收敛为 bump-only，跳过 slab）。
 3. **地址反查 + unmap 认领**（已完成；bump 不回收槽，回收留待后续策略）。
 4. **跨进程锁 + 池块增长 + 兜底透传**（已完成；attach 热路径无锁）。
-5. 接 **OnPg/NUMA**（未做，`Platform_ShmMapOnPg` 仍透传）。
+5. ~~接 **OnPg/NUMA**~~（已完成：块按 (flags, pgname) 分桶，CP 用 `ShmMapOnPg` 建块，
+   任意进程按名 attach；**同名一个槽**——OnPg/普通混用不分裂，NUMA 位置不符时告警）。
 6. 内部项目试用中：复用 Step 1 工具**验证内存占用下降**，据数据在 JSON 配置里调参。

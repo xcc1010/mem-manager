@@ -35,6 +35,16 @@ INT32 Platform_ShmMap(INT32 flags, char* shmname, UINT32 size, void** shm) {
 // is compiled only when IS_CP is defined (see platform_shm.h).
 #ifdef IS_CP
 INT32 Platform_ShmMapOnPg(INT32 flags, char* pgname, char* shmname, UINT32 size, void** shm) {
+#ifdef MEM_MANAGER_POOL
+    INT32 pooled;
+    if (mm_pool_try_map_pg(flags, pgname, shmname, size, shm, &pooled)) {
+#  ifdef MEM_MANAGER_PROFILE
+        shm_profiler_on_map("map_on_pg", shmname, (shm ? *shm : NULL),
+                            size, flags, pooled, pgname);
+#  endif
+        return pooled;
+    }
+#endif
     INT32 ret = ShmMapOnPg(flags, pgname, shmname, size, shm);
 #ifdef MEM_MANAGER_PROFILE
     shm_profiler_on_map("map_on_pg", shmname, (ret >= 0 && shm) ? *shm : NULL,

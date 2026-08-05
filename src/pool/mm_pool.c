@@ -73,11 +73,13 @@ int snprintf(char* s, size_t n, const char* fmt, ...);
 #define MM_MAX_BLOCKS    1024
 #define MM_NAME_CAP      8192            /* open-addressing table; power of two   */
 #define MM_NAME_MAX      64
+#define MM_MAX_PG        32              /* distinct pgnames (NUMA placement keys) */
+#define MM_PGNAME_MAX    32
 #define MM_SLOT_ALIGN    16u
 #define MM_META_NAME     "mmpool/meta"
 #define MM_META_FLAGS    0              /* business type-1 (CP+DP inter-PG, VA-  */
                                         /* differs) is #define'd as 0U in api.h  */
-#define MM_META_MAGIC    0x4D4D504F4F4C3034ULL   /* "MMPOOL04" (layout id) */
+#define MM_META_MAGIC    0x4D4D504F4F4C3035ULL   /* "MMPOOL05" (layout id) */
 #define MM_MAX_BLOCK_SIZE 0x8000000u               /* 128MB = platform OS max segment */
 #define MM_LOCK_RETRIES  20000      /* one try_lock round (~ms)            */
 #define MM_CREATE_ROUNDS 128        /* rounds of {try lock, re-lookup} before passthrough */
@@ -93,6 +95,7 @@ typedef struct {
     UINT32       off;
     UINT32       size;
     INT32        flags;
+    INT32        pgidx;     /* -1 = plain ShmMap slot; >=0 = created via ShmMapOnPg(pgnames[pgidx]) */
     char         name[MM_NAME_MAX];
 } NameEntry;
 
@@ -100,6 +103,7 @@ typedef struct {
     UINT32 size;
     UINT32 next;            /* bump cursor; only touched under the create lock       */
     INT32  flags;
+    INT32  pgidx;           /* -1 = plain block; >=0 = OnPg block on pgnames[pgidx]  */
 } PoolBlock;                /* NOTE: no base pointer — VA-differs blocks have a      */
                             /* different VA in every process; bases are per-process  */
 
@@ -112,6 +116,8 @@ typedef struct {
     UINT32       block_size;
     UINT32       poolable_flags_mask;
     INT32        nblocks;             /* published SetRelease, read ReadAcquire    */
+    INT32        npg;                 /* pgname table fill (only under the lock)   */
+    char         pgnames[MM_MAX_PG][MM_PGNAME_MAX];
     PoolBlock    blocks[MM_MAX_BLOCKS];
     NameEntry    names[MM_NAME_CAP];
 } PoolMeta;
@@ -211,8 +217,11 @@ static void* local_base(PoolMeta* m, int i) {
     INT64 v = AAA_Atomic64ReadAcquire(&g_blk_base[i]);
     if (v) return (void*)(uintptr_t)v;
     char nm[MM_NAME_MAX];
-    snprintf(nm, sizeof nm, "mmpool/blk-%d-%d", (int)m->blocks[i].flags, i);
+    snprintf(nm, sizeof nm, "mmpool/blk-%d-p%d-%d",
+             (int)m->blocks[i].flags, (int)m->blocks[i].pgidx, i);
     void* p = NULL;
+    /* attach is always a plain ShmMap by name — works for OnPg-created
+     * blocks too (name is the unique identifier) */
     INT32 r = ShmMap(m->blocks[i].flags, nm, m->block_size, &p);
     mm_pool_log("block %d attach (%s): pid=%d vcpu=%d ret=%d va=%p", i, nm,
                 (int)MM_POOL_GETPID(), (int)MM_POOL_GETVCPU(), (int)r, p);
@@ -459,7 +468,8 @@ void mm_pool_cleanup(void) {
             INT32 n = nblocks_read(m);
             for (int i = 0; i < n; i++) {
                 char nm[MM_NAME_MAX];
-                snprintf(nm, sizeof nm, "mmpool/blk-%d-%d", (int)m->blocks[i].flags, i);
+                snprintf(nm, sizeof nm, "mmpool/blk-%d-p%d-%d",
+                         (int)m->blocks[i].flags, (int)m->blocks[i].pgidx, i);
                 shm_drain(m->blocks[i].flags, nm, m->block_size);
             }
         }
@@ -544,13 +554,14 @@ static NameEntry* lookup(PoolMeta* m, const char* name) {
 /* Reserve an empty slot and fill its fields, leaving state ST_EMPTY (unpublished).
  * Caller (holding the lock) sets refcount then publishes state with SetRelease. */
 static NameEntry* reserve(PoolMeta* m, const char* name, int blk, UINT32 off,
-                          UINT32 size, INT32 flags) {
+                          UINT32 size, INT32 flags, INT32 pgidx) {
     unsigned h = name_hash(name) & (MM_NAME_CAP - 1);
     for (unsigned i = 0; i < MM_NAME_CAP; i++) {
         NameEntry* e = &m->names[(h + i) & (MM_NAME_CAP - 1)];
         if (e->state == ST_EMPTY) {                     /* plain read: under the lock */
             snprintf(e->name, sizeof e->name, "%s", name);
             e->block_idx = blk; e->off = off; e->size = size; e->flags = flags;
+            e->pgidx = pgidx;
             return e;
         }
     }
@@ -567,14 +578,31 @@ static INT32 nblocks_read(PoolMeta* m) {
     return n > MM_MAX_BLOCKS ? MM_MAX_BLOCKS : n;
 }
 
+/* Resolve pgname -> index into the shared pgname table (insert if new).
+ * Called only under the create lock. Returns -1 when the table is full. */
+static int pg_resolve(PoolMeta* m, const char* pgname) {
+    for (INT32 i = 0; i < m->npg; i++)
+        if (!strncmp(m->pgnames[i], pgname, MM_PGNAME_MAX)) return (int)i;
+    if (m->npg >= MM_MAX_PG) return -1;
+    INT32 idx = m->npg;
+    snprintf(m->pgnames[idx], MM_PGNAME_MAX, "%s", pgname);
+    m->npg = idx + 1;                       /* plain store: under the lock */
+    return (int)idx;
+}
+
 static UINT32 align_up(UINT32 v, UINT32 a) { return (v + (a - 1)) & ~(a - 1); }
 
-static int carve_bump(PoolMeta* m, UINT32 size, INT32 flags, int* blk_out, UINT32* off_out) {
+/* Carve `size` bytes from a block matching (flags, pgidx); create a new block
+ * if none has room. pgidx >= 0 means the block must live on the NUMA node of
+ * pgnames[pgidx] (created via ShmMapOnPg — CP-only symbol; the DP never takes
+ * that branch because the OnPg wrapper exists only on the CP). */
+static int carve_bump(PoolMeta* m, UINT32 size, INT32 flags, INT32 pgidx,
+                      int* blk_out, UINT32* off_out) {
     UINT32 need = align_up(size, MM_SLOT_ALIGN);
     INT32 n = nblocks_read(m);
     for (int i = 0; i < n; i++) {
         PoolBlock* b = &m->blocks[i];
-        if (b->flags != flags) continue;
+        if (b->flags != flags || b->pgidx != pgidx) continue;
         UINT32 start = align_up(b->next, MM_SLOT_ALIGN);
         if (start <= b->size && need <= b->size - start) {
             b->next = start + need;
@@ -587,13 +615,22 @@ static int carve_bump(PoolMeta* m, UINT32 size, INT32 flags, int* blk_out, UINT3
 
     void* base = NULL;
     char  nm[MM_NAME_MAX];
-    snprintf(nm, sizeof nm, "mmpool/blk-%d-%d", (int)flags, n);
-    INT32 r = ShmMap(flags, nm, m->block_size, &base);
+    snprintf(nm, sizeof nm, "mmpool/blk-%d-p%d-%d", (int)flags, (int)pgidx, n);
+    INT32 r;
+    if (pgidx < 0) {
+        r = ShmMap(flags, nm, m->block_size, &base);
+    } else {
+#ifdef IS_CP
+        r = ShmMapOnPg(flags, m->pgnames[pgidx], nm, m->block_size, &base);
+#else
+        return 0;           /* DP has no ShmMapOnPg; unreachable via wrappers  */
+#endif
+    }
     if (r < 0 || !base) return 0;
 
     AAA_Atomic64SetRelease(&g_blk_base[n], (INT64)(uintptr_t)base);  /* our VA */
     PoolBlock* b = &m->blocks[n];
-    b->size = m->block_size; b->next = need; b->flags = flags;
+    b->size = m->block_size; b->next = need; b->flags = flags; b->pgidx = pgidx;
     AAA_Atomic32SetRelease(&m->nblocks, n + 1);          /* publish block */
     *blk_out = n; *off_out = 0;
     return 1;
@@ -631,7 +668,12 @@ static int attach(PoolMeta* m, NameEntry* e, void** out, INT32* ret) {
     return 1;
 }
 
-int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret) {
+/* Shared routing for plain ShmMap (pgname == NULL) and ShmMapOnPg. A name is
+ * ONE slot regardless of which API mapped it first: an OnPg caller attaching
+ * a slot pinned to a different pg's node still gets the SAME data (only the
+ * NUMA locality differs) — warn once, never split. */
+static int try_map_common(INT32 flags, const char* pgname, char* name,
+                          UINT32 size, void** out, INT32* ret) {
     ensure_init();
     PoolMeta* m = meta_get();      /* opaque atomic load: the NULL guard below
                                       cannot be reordered/speculated away     */
@@ -652,14 +694,15 @@ int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret
     if (name_len(name, MM_NAME_MAX) >= MM_NAME_MAX)
                                { MM_REJECT_LOG("name too long"); return 0; }
     if (!poolable(m, flags, size)) { MM_REJECT_LOG("not poolable"); return 0; }
-    MM_TRACE(0, "try_map: name=%s flags=%d size=0x%x", name, (int)flags, (unsigned)size);
+    MM_TRACE(0, "try_map: name=%s flags=%d size=0x%x pg=%s",
+             name, (int)flags, (unsigned)size, pgname ? pgname : "-");
 
     /* attach hot path: lock-free lookup + atomic refcount */
     NameEntry* e = lookup(m, name);
     if (e) {
         if (!entry_ok(e, flags, size)) goto conflict;
         MM_TRACE(1, "attach: name=%s blk=%d off=0x%x", name, (int)e->block_idx, (unsigned)e->off);
-        return attach(m, e, out, ret);
+        goto have_entry;
     }
 
     /* Create path. A concurrent process may be publishing this same name
@@ -674,15 +717,24 @@ int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret
             MM_TRACE(2, "create lock: name=%s round=%d", name, round);
             e = lookup(m, name);                    /* double-check under lock */
             if (!e) {
+                INT32 pgidx = -1;
+                if (pgname) {
+                    pgidx = pg_resolve(m, pgname);
+                    if (pgidx < 0) {                /* pgname table full */
+                        unlock(m);
+                        MM_REJECT_LOG("pg table full");
+                        return 0;
+                    }
+                }
                 int blk; UINT32 off;
-                if (!carve_bump(m, size, flags, &blk, &off)) {
+                if (!carve_bump(m, size, flags, pgidx, &blk, &off)) {
                     unlock(m);
                     MM_REJECT_LOG("carve failed (pool full)");
                     return 0;
                 }
                 void* base = local_base(m, blk);    /* cached for a fresh block */
                 if (!base)                                 { unlock(m); return 0; }
-                e = reserve(m, name, blk, off, size, flags);
+                e = reserve(m, name, blk, off, size, flags, pgidx);
                 if (!e)                                    { unlock(m); return 0; }
                 AAA_Atomic32SetRelaxed(&e->refcount, 1);
                 AAA_Atomic32SetRelease(&e->state, ST_USED);  /* publish */
@@ -697,14 +749,17 @@ int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret
                 unlock(m);
                 goto conflict;
             }
-            int rc = attach(m, e, out, ret);
+            int rc;
+            goto have_entry_locked;                 /* attach under the lock */
+have_entry_locked:
+            rc = attach(m, e, out, ret);
             unlock(m);
             return rc;
         }
         e = lookup(m, name);                        /* creator may have published meanwhile */
         if (e) {
             if (!entry_ok(e, flags, size)) goto conflict;
-            return attach(m, e, out, ret);
+            goto have_entry;
         }
     }
     /* Budget exhausted with the entry still missing: either the create lock
@@ -715,10 +770,40 @@ int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret
     MM_REJECT_LOG("create exhausted (lock frozen? pool/table full?)");
     return 0;
 
+have_entry:
+    /* Same slot for every API: only warn when an OnPg caller lands on a slot
+     * pinned to a DIFFERENT pg's node (data is still correct, locality is
+     * not what it asked for). */
+    if (pgname && (e->pgidx < 0 ||
+                   strncmp(m->pgnames[e->pgidx], pgname, MM_PGNAME_MAX))) {
+        static INT32 nwarn;
+        if (AAA_Atomic32IncReturn(&nwarn) <= 16)
+            mm_pool_log("WARN: %s mapped OnPg(%s) but slot lives on %s", name,
+                        pgname,
+                        e->pgidx < 0 ? "a plain block" : m->pgnames[e->pgidx]);
+    }
+    return attach(m, e, out, ret);
+
 conflict:
     *out = NULL;
     *ret = -1;              /* OS-style failure: visible to the caller, not silent */
     return -1;
+}
+
+int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret) {
+    return try_map_common(flags, NULL, name, size, out, ret);
+}
+
+int mm_pool_try_map_pg(INT32 flags, char* pgname, char* name, UINT32 size,
+                       void** out, INT32* ret) {
+#ifdef IS_CP
+    if (!pgname) return try_map_common(flags, NULL, name, size, out, ret);
+    return try_map_common(flags, pgname, name, size, out, ret);
+#else
+    /* DP link env has no ShmMapOnPg and no OnPg wrapper — unreachable. */
+    (void)flags; (void)pgname; (void)name; (void)size; (void)out; (void)ret;
+    return 0;
+#endif
 }
 
 int mm_pool_try_unmap(void* addr, INT32* ret) {

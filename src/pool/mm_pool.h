@@ -104,6 +104,13 @@ void mm_pool_cleanup(void);
  * never end up both pooled and OS-private. */
 int mm_pool_try_map(INT32 flags, char* name, UINT32 size, void** out, INT32* ret);
 
+/* Try to satisfy an OnPg map from the pool (CP only — the DP link env has no
+ * ShmMapOnPg; there this returns 0). Same registry as plain maps: a name is
+ * ONE slot regardless of the API used; only block CREATION differs (pinned to
+ * pgname's NUMA node via ShmMapOnPg). Return values as mm_pool_try_map. */
+int mm_pool_try_map_pg(INT32 flags, char* pgname, char* name, UINT32 size,
+                       void** out, INT32* ret);
+
 /* Try to satisfy an unmap. Returns 1 if addr belonged to the pool (handled,
  * *ret set to 0 = success; the sub-allocation is NOT returned to the OS), 0 if
  * the caller must call OS ShmUnmap. */

@@ -208,6 +208,25 @@ static void test_cleanup(const Mm_PoolCfg* cfg) {
     printf("cleanup: ok\n");
 }
 
+/* ---- OnPg unification: one name = one slot regardless of the API ----
+ * The POOL_STATIC_INFO failure mode: created via ShmMapOnPg (raw before),
+ * read via plain ShmMap (pooled) -> split. Now both land on the same slot. */
+static void test_onpg(void) {
+    void *a = NULL, *b = NULL, *c = NULL;
+    INT32 r;
+
+    r = Platform_ShmMapOnPg(1, "pg0", "pg/shared", 512, &a);   /* OnPg creates */
+    assert(r == 1 && a);
+
+    r = Platform_ShmMap(1, "pg/shared", 512, &b);              /* plain attach */
+    assert(r == 2 && b == a);                  /* SAME slot — no split */
+
+    r = Platform_ShmMapOnPg(1, "pg1", "pg/shared", 512, &c);   /* other pg attaches */
+    assert(r == 3 && c == a);                  /* same slot, only locality differs */
+
+    printf("onpg: ok\n");
+}
+
 int main(void) {
     Mm_PoolCfg cfg;
     mm_pool_default_cfg(&cfg);
@@ -224,6 +243,7 @@ int main(void) {
     test_concurrent_init();
     test_json_config();
     test_conflict();
+    test_onpg();
     test_cleanup(&cfg);
 
     printf("pool v1 (bump, shared-meta, lock-free attach) tests passed\n");
